@@ -713,7 +713,7 @@ export default function App() {
         </div>
       </nav>
 
-      <main className="flex-1 min-w-0 overflow-y-auto relative bg-zinc-950 pt-14 pb-24 md:pt-0 md:pb-0">
+      <main className="flex-1 min-w-0 overflow-y-auto relative bg-zinc-950 pt-14 pb-28 md:pt-0 md:pb-0">
         <div className={`${activeTab === 'direct' || activeTab === 'communities' ? 'w-full' : 'max-w-4xl mx-auto'} min-h-full`}>
           {activeTab === 'feed' && <FeedView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'direct' && <DirectView currentUser={currentUser} onOpenProfile={openProfile} />}
@@ -2269,6 +2269,11 @@ function ShoppingView({ currentUser, onOpenProfile }) {
   });
 
   const formatBRL = (value) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(Number(value || 0));
+  const shoppingMapQuery = newItem.location.trim();
+  const shoppingMapSearchUrl = buildGoogleMapsSearchUrl(shoppingMapQuery);
+  const shoppingMapEmbedUrl = shoppingMapQuery
+    ? `https://www.google.com/maps?q=${encodeURIComponent(shoppingMapQuery)}&output=embed`
+    : '';
 
   return (
     <div className="p-4 md:p-8">
@@ -2304,6 +2309,30 @@ function ShoppingView({ currentUser, onOpenProfile }) {
               <option value="new">Novo</option>
             </select>
             <input type="text" value={newItem.purchase_url} onChange={(event) => setNewItem((prev) => ({ ...prev, purchase_url: event.target.value }))} placeholder="Link de compra/contato" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+          </div>
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-zinc-500">Local no Maps</span>
+              <a
+                href={shoppingMapSearchUrl || '#'}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(event) => {
+                  if (!shoppingMapSearchUrl) event.preventDefault();
+                }}
+                className={`text-xs px-2 py-1 rounded-md ${shoppingMapSearchUrl ? 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700' : 'bg-zinc-900 text-zinc-600 cursor-not-allowed'}`}
+              >
+                Escolher no Maps
+              </a>
+            </div>
+            {shoppingMapEmbedUrl && (
+              <iframe
+                src={shoppingMapEmbedUrl}
+                title="Preview local Shopping"
+                className="w-full h-48 rounded-xl border border-zinc-800"
+                loading="lazy"
+              />
+            )}
           </div>
           <textarea value={newItem.description} onChange={(event) => setNewItem((prev) => ({ ...prev, description: event.target.value }))} rows={3} placeholder="Descricao do produto..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500 resize-none" />
           <input type="text" value={newItem.image_url} onChange={(event) => setNewItem((prev) => ({ ...prev, image_url: event.target.value }))} placeholder="URL da imagem (opcional)" className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
@@ -2594,6 +2623,11 @@ function EventsView({ currentUser, onOpenProfile }) {
     if (timezone) options.timeZone = timezone;
     return new Intl.DateTimeFormat('pt-BR', options).format(parsedDate);
   };
+  const eventMapQuery = `${newEvent.venue || ''} ${newEvent.city || ''}`.trim();
+  const eventMapSearchUrl = buildGoogleMapsSearchUrl(eventMapQuery);
+  const eventMapEmbedUrl = eventMapQuery
+    ? `https://www.google.com/maps?q=${encodeURIComponent(eventMapQuery)}&output=embed`
+    : '';
 
   return (
     <div className="p-4 md:p-8">
@@ -2655,6 +2689,30 @@ function EventsView({ currentUser, onOpenProfile }) {
                 className="w-full mt-1"
               />
             </label>
+          </div>
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-zinc-500">Local no Maps</span>
+              <a
+                href={eventMapSearchUrl || '#'}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(event) => {
+                  if (!eventMapSearchUrl) event.preventDefault();
+                }}
+                className={`text-xs px-2 py-1 rounded-md ${eventMapSearchUrl ? 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700' : 'bg-zinc-900 text-zinc-600 cursor-not-allowed'}`}
+              >
+                Escolher no Maps
+              </a>
+            </div>
+            {eventMapEmbedUrl && (
+              <iframe
+                src={eventMapEmbedUrl}
+                title="Preview local Evento"
+                className="w-full h-48 rounded-xl border border-zinc-800"
+                loading="lazy"
+              />
+            )}
           </div>
           <textarea value={newEvent.description} onChange={(event) => setNewEvent((prev) => ({ ...prev, description: event.target.value }))} rows={3} placeholder="Descricao do evento..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500 resize-none" />
           <label className="inline-flex items-center gap-2 text-sm text-zinc-300">
@@ -4223,26 +4281,28 @@ function MobileBottomNav({ items, activeTab, onSelect }) {
   return (
     <nav
       className="md:hidden fixed bottom-0 inset-x-0 z-40 border-t border-zinc-800 bg-zinc-950/95 backdrop-blur"
-      style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 0.35rem)' }}
+      style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 0.75rem)' }}
     >
-      <div className="grid gap-1 px-1 pt-1.5" style={{ gridTemplateColumns: `repeat(${Math.max(1, items.length)}, minmax(0, 1fr))` }}>
-        {items.map((item) => {
-          const Icon = item.icon;
-          const isActive = activeTab === item.id;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => onSelect(item.id)}
-              className={`flex flex-col items-center justify-center gap-0.5 rounded-xl py-2 transition-colors ${
-                isActive ? 'text-violet-400 bg-violet-500/10' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
-              }`}
-            >
-              <Icon className={`w-5 h-5 ${isActive ? 'text-violet-400' : ''}`} />
-              <span className="text-[10px] leading-none font-medium">{item.label}</span>
-            </button>
-          );
-        })}
+      <div className="overflow-x-auto px-2 pt-1.5">
+        <div className="flex items-center gap-1 min-w-max">
+          {items.map((item) => {
+            const Icon = item.icon;
+            const isActive = activeTab === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onSelect(item.id)}
+                className={`shrink-0 w-12 h-12 flex items-center justify-center rounded-xl transition-colors ${
+                  isActive ? 'text-violet-400 bg-violet-500/10' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
+                }`}
+                title={item.label}
+              >
+                <Icon className={`w-5 h-5 ${isActive ? 'text-violet-400' : ''}`} />
+              </button>
+            );
+          })}
+        </div>
       </div>
     </nav>
   );
