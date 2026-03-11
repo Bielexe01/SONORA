@@ -23,7 +23,11 @@ const ASCENSAO_LIKES_STORAGE_KEY = 'sonora_ascensao_likes';
 const USER_FOLLOWS_STORAGE_KEY = 'sonora_user_follows';
 const COMMUNITY_DEFAULT_GENRES = ['Rock', 'Pop', 'Rap', 'Eletronica', 'Gospel', 'MPB'];
 const AVAILABLE_APP_TABS = new Set(['feed', 'direct', 'communities', 'playlists', 'ascensao', 'profile']);
-const SPOTIFY_OAUTH_STATE = 'sonora_spotify_oauth';
+const SPOTIFY_CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID || 'aeed4c6250654ee6b74e806422f15a3b';
+const SPOTIFY_TOKEN_STORAGE_KEY = 'spotify_token';
+const SPOTIFY_AUTH_DATA_STORAGE_KEY = 'sonora_spotify_auth_data';
+const SPOTIFY_PKCE_VERIFIER_STORAGE_KEY = 'sonora_spotify_pkce_verifier';
+const SPOTIFY_PKCE_STATE_STORAGE_KEY = 'sonora_spotify_pkce_state';
 const APP_NAV_ITEMS = [
   { id: 'feed', label: 'Feed', icon: Home },
   { id: 'direct', label: 'Direct', icon: MessageCircle },
@@ -32,6 +36,114 @@ const APP_NAV_ITEMS = [
   { id: 'ascensao', label: 'Ascensao', icon: TrendingUp },
   { id: 'profile', label: 'Perfil', icon: User }
 ];
+
+const getSpotifyRedirectUri = () => `${window.location.origin}/`;
+
+const getSpotifyAuthData = () => {
+  try {
+    const raw = window.localStorage.getItem(SPOTIFY_AUTH_DATA_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const setSpotifyAuthData = (authData) => {
+  if (!authData || typeof authData !== 'object') return;
+  window.localStorage.setItem(SPOTIFY_AUTH_DATA_STORAGE_KEY, JSON.stringify(authData));
+  if (authData.access_token) window.localStorage.setItem(SPOTIFY_TOKEN_STORAGE_KEY, authData.access_token);
+};
+
+const clearSpotifyAuthData = () => {
+  window.localStorage.removeItem(SPOTIFY_AUTH_DATA_STORAGE_KEY);
+  window.localStorage.removeItem(SPOTIFY_TOKEN_STORAGE_KEY);
+  window.localStorage.removeItem(SPOTIFY_PKCE_VERIFIER_STORAGE_KEY);
+  window.localStorage.removeItem(SPOTIFY_PKCE_STATE_STORAGE_KEY);
+};
+
+const createRandomString = (length = 64) => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+  const values = window.crypto.getRandomValues(new Uint8Array(length));
+  return Array.from(values, (value) => chars[value % chars.length]).join('');
+};
+
+const toBase64Url = (arrayBuffer) => (
+  btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')
+);
+
+const createCodeChallenge = async (verifier) => {
+  const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return toBase64Url(digest);
+};
+
+const exchangeSpotifyCodeForTokens = async ({ code, codeVerifier }) => {
+  const payload = new URLSearchParams({
+    client_id: SPOTIFY_CLIENT_ID,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: getSpotifyRedirectUri(),
+    code_verifier: codeVerifier
+  });
+
+  const response = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: payload.toString()
+  });
+
+  if (!response.ok) throw new Error('Falha ao trocar codigo do Spotify por token.');
+  return response.json();
+};
+
+const refreshSpotifyAccessToken = async (refreshToken) => {
+  if (!refreshToken) return null;
+
+  const payload = new URLSearchParams({
+    client_id: SPOTIFY_CLIENT_ID,
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken
+  });
+
+  const response = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: payload.toString()
+  });
+
+  if (!response.ok) return null;
+  return response.json();
+};
+
+const getValidSpotifyAccessToken = async () => {
+  const authData = getSpotifyAuthData();
+  if (!authData?.access_token) return window.localStorage.getItem(SPOTIFY_TOKEN_STORAGE_KEY) || null;
+
+  const expiresAt = Number(authData.expires_at || 0);
+  const isStillValid = Number.isFinite(expiresAt) && Date.now() < expiresAt - 30 * 1000;
+  if (isStillValid) return authData.access_token;
+
+  const refreshed = await refreshSpotifyAccessToken(authData.refresh_token);
+  if (!refreshed?.access_token) return null;
+
+  const nextAuthData = {
+    ...authData,
+    access_token: refreshed.access_token,
+    refresh_token: refreshed.refresh_token || authData.refresh_token,
+    scope: refreshed.scope || authData.scope,
+    token_type: refreshed.token_type || authData.token_type,
+    expires_at: Date.now() + Number(refreshed.expires_in || 3600) * 1000
+  };
+  setSpotifyAuthData(nextAuthData);
+  return nextAuthData.access_token;
+};
 
 const normalizeHandleSeed = (value) => (
   String(value || '')
@@ -350,18 +462,58 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    // Capturar token do Spotify apenas quando o callback for do Spotify.
-    const hash = window.location.hash;
-    if (hash && hash.includes('access_token')) {
-      const hashParams = new URLSearchParams(hash.substring(1));
-      const token = hashParams.get('access_token');
-      const state = hashParams.get('state');
-      const tokenType = hashParams.get('token_type');
-      if (token && state === SPOTIFY_OAUTH_STATE && tokenType) {
-        window.localStorage.setItem('spotify_token', token);
-        window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    const processSpotifyCallback = async () => {
+      // PKCE callback
+      const url = new URL(window.location.href);
+      const callbackCode = url.searchParams.get('code');
+      const callbackState = url.searchParams.get('state');
+      const storedState = window.localStorage.getItem(SPOTIFY_PKCE_STATE_STORAGE_KEY);
+      const storedVerifier = window.localStorage.getItem(SPOTIFY_PKCE_VERIFIER_STORAGE_KEY);
+      const isSpotifyPkceCallback = Boolean(callbackCode && callbackState && storedState && callbackState === storedState && storedVerifier);
+
+      if (isSpotifyPkceCallback) {
+        try {
+          const tokenData = await exchangeSpotifyCodeForTokens({
+            code: callbackCode,
+            codeVerifier: storedVerifier
+          });
+
+          setSpotifyAuthData({
+            access_token: tokenData.access_token,
+            refresh_token: tokenData.refresh_token || null,
+            scope: tokenData.scope || '',
+            token_type: tokenData.token_type || 'Bearer',
+            expires_at: Date.now() + Number(tokenData.expires_in || 3600) * 1000
+          });
+        } catch (error) {
+          console.error('Erro no callback do Spotify:', error);
+        } finally {
+          window.localStorage.removeItem(SPOTIFY_PKCE_STATE_STORAGE_KEY);
+          window.localStorage.removeItem(SPOTIFY_PKCE_VERIFIER_STORAGE_KEY);
+          url.searchParams.delete('code');
+          url.searchParams.delete('state');
+          url.searchParams.delete('error');
+          url.searchParams.delete('error_description');
+          window.history.replaceState(null, '', `${url.pathname}${url.search}`);
+        }
+        return;
       }
-    }
+
+      // Legacy hash token fallback
+      const hash = window.location.hash;
+      if (hash && hash.includes('access_token')) {
+        const hashParams = new URLSearchParams(hash.substring(1));
+        const token = hashParams.get('access_token');
+        const state = hashParams.get('state');
+        const tokenType = hashParams.get('token_type');
+        if (token && state === 'sonora_spotify_oauth' && tokenType) {
+          window.localStorage.setItem(SPOTIFY_TOKEN_STORAGE_KEY, token);
+          window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+        }
+      }
+    };
+
+    processSpotifyCallback();
 
     // Verificar sessao do Supabase
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -2563,7 +2715,8 @@ function ProfileView({ user, setUser, viewerUser }) {
   const avatarRef = useRef(null);
   const coverRef = useRef(null);
 
-  const spotifyToken = window.localStorage.getItem('spotify_token');
+  const spotifyToken = window.localStorage.getItem(SPOTIFY_TOKEN_STORAGE_KEY);
+  const hasSpotifyConnection = Boolean(getSpotifyAuthData()?.refresh_token || spotifyToken);
   const isOwnProfile = String(user?.id || '') === String(viewerUser?.id || '');
 
   useEffect(() => {
@@ -2571,16 +2724,51 @@ function ProfileView({ user, setUser, viewerUser }) {
   }, [user.id, user.name, user.bio, user.handle]);
 
   useEffect(() => {
-    if (spotifyToken && !capsuleData) {
-      fetch('https://api.spotify.com/v1/me/top/artists?limit=4', {
-        headers: { Authorization: `Bearer ${spotifyToken}` }
-      })
-      .then((res) => res.json())
-      .then((data) => {
-        if (data && data.items) setCapsuleData(data.items);
-      })
-      .catch(console.error);
-    }
+    let cancelled = false;
+
+    const loadCapsule = async () => {
+      if (capsuleData) return;
+
+      try {
+        let accessToken = await getValidSpotifyAccessToken();
+        if (!accessToken) return;
+
+        const requestTopArtists = async (token) => fetch('https://api.spotify.com/v1/me/top/artists?limit=4', {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        let response = await requestTopArtists(accessToken);
+        if (response.status === 401) {
+          const authData = getSpotifyAuthData();
+          const refreshed = await refreshSpotifyAccessToken(authData?.refresh_token);
+          if (refreshed?.access_token) {
+            const nextAuthData = {
+              ...(authData || {}),
+              access_token: refreshed.access_token,
+              refresh_token: refreshed.refresh_token || authData?.refresh_token || null,
+              scope: refreshed.scope || authData?.scope || '',
+              token_type: refreshed.token_type || authData?.token_type || 'Bearer',
+              expires_at: Date.now() + Number(refreshed.expires_in || 3600) * 1000
+            };
+            setSpotifyAuthData(nextAuthData);
+            accessToken = nextAuthData.access_token;
+            response = await requestTopArtists(accessToken);
+          } else {
+            clearSpotifyAuthData();
+            return;
+          }
+        }
+
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!cancelled && data?.items) setCapsuleData(data.items);
+      } catch (error) {
+        console.error('Erro ao carregar Capsula Spotify:', error);
+      }
+    };
+
+    loadCapsule();
+    return () => { cancelled = true; };
   }, [spotifyToken, capsuleData]);
 
   useEffect(() => {
@@ -2787,12 +2975,32 @@ function ProfileView({ user, setUser, viewerUser }) {
     setLoadingCollections(false);
   };
 
-  const handleSpotifyConnect = () => {
-    const clientId = 'aeed4c6250654ee6b74e806422f15a3b';
-    const redirectUri = encodeURIComponent(window.location.origin + '/');
-    const scope = encodeURIComponent('user-top-read user-read-private');
-    const state = encodeURIComponent(SPOTIFY_OAUTH_STATE);
-    window.location.href = `https://accounts.spotify.com/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=${scope}&response_type=token&state=${state}`;
+  const handleSpotifyConnect = async () => {
+    try {
+      const codeVerifier = createRandomString(96);
+      const state = createRandomString(32);
+      const codeChallenge = await createCodeChallenge(codeVerifier);
+      const scope = 'user-top-read user-read-private';
+
+      window.localStorage.setItem(SPOTIFY_PKCE_VERIFIER_STORAGE_KEY, codeVerifier);
+      window.localStorage.setItem(SPOTIFY_PKCE_STATE_STORAGE_KEY, state);
+
+      const params = new URLSearchParams({
+        client_id: SPOTIFY_CLIENT_ID,
+        response_type: 'code',
+        redirect_uri: getSpotifyRedirectUri(),
+        code_challenge_method: 'S256',
+        code_challenge: codeChallenge,
+        scope,
+        state,
+        show_dialog: 'true'
+      });
+
+      window.location.href = `https://accounts.spotify.com/authorize?${params.toString()}`;
+    } catch (error) {
+      console.error('Erro ao iniciar OAuth Spotify:', error);
+      alert('Nao foi possivel iniciar conexao com Spotify.');
+    }
   };
 
   const handleImageUpload = async (event, field) => {
@@ -3087,14 +3295,14 @@ function ProfileView({ user, setUser, viewerUser }) {
         <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6">
           <h3 className="text-lg font-bold text-white mb-4 flex items-center"><Headphones className="h-6 w-6 mr-2 text-emerald-500" /> Conexao Spotify</h3>
           <p className="text-zinc-400 text-sm mb-6">Conecte sua conta para sincronizar a Capsula do Tempo.</p>
-          <button onClick={handleSpotifyConnect} className={`w-full py-3 rounded-xl font-bold flex items-center justify-center transition-colors ${spotifyToken ? 'bg-zinc-800 text-emerald-500 hover:bg-zinc-700' : 'bg-emerald-500 text-zinc-950 hover:bg-emerald-400'}`}>
-            {spotifyToken ? <><Check className="w-5 h-5 mr-2" /> Conectado</> : 'Conectar'}
+          <button onClick={handleSpotifyConnect} className={`w-full py-3 rounded-xl font-bold flex items-center justify-center transition-colors ${hasSpotifyConnection ? 'bg-zinc-800 text-emerald-500 hover:bg-zinc-700' : 'bg-emerald-500 text-zinc-950 hover:bg-emerald-400'}`}>
+            {hasSpotifyConnection ? <><Check className="w-5 h-5 mr-2" /> Conectado</> : 'Conectar'}
           </button>
         </div>
 
-        <div className={`border rounded-2xl p-6 relative overflow-hidden ${spotifyToken ? 'bg-zinc-900 border-zinc-800' : 'bg-zinc-950 border-zinc-900 opacity-50'}`}>
+        <div className={`border rounded-2xl p-6 relative overflow-hidden ${hasSpotifyConnection ? 'bg-zinc-900 border-zinc-800' : 'bg-zinc-950 border-zinc-900 opacity-50'}`}>
           <h3 className="text-lg font-bold text-white mb-4 relative z-10">Capsula do Tempo</h3>
-          {spotifyToken && capsuleData ? (
+          {hasSpotifyConnection && capsuleData ? (
             <div className="relative z-10">
               <p className="text-xs text-zinc-500 uppercase tracking-wider mb-3">Seus artistas mais ouvidos</p>
               <div className="space-y-3">
