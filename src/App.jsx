@@ -3,7 +3,7 @@ import {
   Home, MessageCircle, Users, ListMusic, TrendingUp, User, 
   Heart, MessageSquare, Share2, Play, Music, Edit3, 
   Check, X, Search, PlusCircle, Headphones, Star, Award, 
-  LogOut, Image as ImageIcon, Link as LinkIcon, Trash2, Send, Camera
+  LogOut, Image as ImageIcon, Link as LinkIcon, Trash2, Send, Camera, Chrome
 } from 'lucide-react';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.3/+esm';
 import CommunitiesHub from './CommunitiesHub.jsx';
@@ -29,6 +29,30 @@ const APP_NAV_ITEMS = [
   { id: 'ascensao', label: 'Ascensao', icon: TrendingUp },
   { id: 'profile', label: 'Perfil', icon: User }
 ];
+
+const normalizeHandleSeed = (value) => (
+  String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '')
+    .slice(0, 18)
+);
+
+const buildProfilePayloadFromAuthUser = (authUser) => {
+  const metadata = authUser?.user_metadata || {};
+  const fallbackSeed = authUser?.email ? authUser.email.split('@')[0] : 'usuario';
+  const rawName = metadata.name || metadata.full_name || metadata.user_name || fallbackSeed || 'Usuario';
+  const seed = normalizeHandleSeed(metadata.preferred_username || rawName || fallbackSeed) || 'sonora';
+  const uniqueSuffix = Math.floor(Math.random() * 100000).toString().padStart(5, '0');
+
+  return {
+    id: authUser.id,
+    name: String(rawName).trim() || 'Usuario',
+    handle: `@${seed}${uniqueSuffix}`,
+    avatar_url: metadata.avatar_url || metadata.picture || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(rawName || seed)}`
+  };
+};
 
 const getInitialTabFromUrl = () => {
   try {
@@ -336,14 +360,14 @@ export default function App() {
     // Verificar sessao do Supabase
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
-      if (session) fetchProfile(session.user.id);
+      if (session?.user) fetchProfile(session.user);
       else setIsLoading(false);
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session) {
-        fetchProfile(session.user.id);
+      if (session?.user) {
+        fetchProfile(session.user);
       } else {
         setIsAuthenticated(false);
         setCurrentUser(null);
@@ -355,12 +379,47 @@ export default function App() {
     return () => subscription.unsubscribe();
   }, []);
 
-  const fetchProfile = async (userId) => {
+  const fetchProfile = async (authUser) => {
+    const userId = authUser?.id || '';
+    if (!userId) {
+      setIsLoading(false);
+      return;
+    }
+
     try {
-      const { data, error } = await supabase.from('profiles').select('*').eq('id', userId).single();
-      if (error) throw error;
-      setCurrentUser(data);
-      setSelectedProfile((prev) => (!prev || String(prev.id) === String(data.id) ? data : prev));
+      const { data: existingProfile, error: profileError } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .maybeSingle();
+      if (profileError) throw profileError;
+
+      let resolvedProfile = existingProfile;
+      if (!resolvedProfile) {
+        let lastInsertError = null;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const payload = buildProfilePayloadFromAuthUser(authUser);
+          const { data: insertedProfile, error: insertError } = await supabase
+            .from('profiles')
+            .insert([payload])
+            .select('*')
+            .single();
+
+          if (!insertError && insertedProfile) {
+            resolvedProfile = insertedProfile;
+            lastInsertError = null;
+            break;
+          }
+
+          lastInsertError = insertError;
+          if (!insertError || insertError.code !== '23505') break;
+        }
+
+        if (!resolvedProfile && lastInsertError) throw lastInsertError;
+      }
+
+      setCurrentUser(resolvedProfile);
+      setSelectedProfile((prev) => (!prev || String(prev.id) === String(resolvedProfile.id) ? resolvedProfile : prev));
       setIsAuthenticated(true);
     } catch (error) {
       console.error('Erro ao buscar perfil:', error);
@@ -408,7 +467,7 @@ export default function App() {
     );
   }
 
-  if (!isAuthenticated) return <LoginScreen onLoginSuccess={(userId) => fetchProfile(userId)} />;
+  if (!isAuthenticated) return <LoginScreen />;
 
   return (
     <div className="flex min-h-screen md:h-screen bg-zinc-950 text-zinc-100 overflow-hidden font-sans">
@@ -487,12 +546,15 @@ export default function App() {
 
 // --- SUB-VIEWS ---
 
-function LoginScreen({ onLoginSuccess }) {
+function LoginScreen() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [isLogin, setIsLogin] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
+
+  const getAuthRedirectUrl = () => `${window.location.origin}/`;
 
   const handleAuth = async (e) => {
     e.preventDefault();
@@ -502,19 +564,39 @@ function LoginScreen({ onLoginSuccess }) {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
       } else {
-        const { data, error } = await supabase.auth.signUp({ email, password });
+        const { error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            emailRedirectTo: getAuthRedirectUrl(),
+            data: {
+              name: name.trim()
+            }
+          }
+        });
         if (error) throw error;
-        if (data.user) {
-          const handleStr = '@' + name.toLowerCase().replace(/\s+/g, '') + Math.floor(Math.random() * 1000);
-          await supabase.from('profiles').insert([{ id: data.user.id, name, handle: handleStr, avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${name}` }]);
-          alert('Conta criada com sucesso! Faca login.');
-          setIsLogin(true);
-        }
+        alert('Conta criada. Verifique seu email para confirmar o acesso.');
+        setIsLogin(true);
       }
     } catch (error) {
       alert('Erro: ' + error.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleGoogleLogin = async () => {
+    if (googleLoading) return;
+    setGoogleLoading(true);
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: getAuthRedirectUrl()
+      }
+    });
+    if (error) {
+      alert('Erro ao entrar com Google: ' + error.message);
+      setGoogleLoading(false);
     }
   };
 
@@ -524,7 +606,7 @@ function LoginScreen({ onLoginSuccess }) {
         <Headphones className="w-16 h-16 text-violet-500 mx-auto mb-6" />
         <h1 className="text-3xl font-bold text-white mb-2">Sonora</h1>
         <p className="text-zinc-400 mb-8">A sua rede social de musica.</p>
-        <form onSubmit={handleAuth} className="space-y-4 mb-6">
+        <form onSubmit={handleAuth} className="space-y-4 mb-5">
           {!isLogin && <input type="text" placeholder="Nome Artistico" required value={name} onChange={e => setName(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500" />}
           <input type="email" placeholder="Email" required value={email} onChange={e => setEmail(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500" />
           <input type="password" placeholder="Palavra-passe" required value={password} onChange={e => setPassword(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500" />
@@ -532,6 +614,20 @@ function LoginScreen({ onLoginSuccess }) {
             {loading ? 'A processar...' : (isLogin ? 'Entrar' : 'Criar Conta')}
           </button>
         </form>
+        <div className="flex items-center gap-3 text-xs text-zinc-600 mb-5">
+          <div className="h-px bg-zinc-800 flex-1"></div>
+          <span>ou</span>
+          <div className="h-px bg-zinc-800 flex-1"></div>
+        </div>
+        <button
+          type="button"
+          onClick={handleGoogleLogin}
+          disabled={googleLoading}
+          className="w-full mb-6 bg-white hover:bg-zinc-200 disabled:opacity-60 text-zinc-950 font-semibold py-3 px-4 rounded-xl transition-all flex items-center justify-center gap-2"
+        >
+          <Chrome className="w-5 h-5" />
+          {googleLoading ? 'A redirecionar...' : 'Entrar com Google'}
+        </button>
         <button type="button" onClick={() => setIsLogin(!isLogin)} className="text-zinc-500 hover:text-white text-sm">
           {isLogin ? 'Nao tem conta? Crie uma' : 'Ja tem conta? Inicie sessao'}
         </button>
@@ -704,6 +800,7 @@ function FeedView({ currentUser, onOpenProfile }) {
 function PostCard({ post, currentUser, fetchPosts, onOpenProfile }) {
   const [liked, setLiked] = useState(false);
   const [likesCount, setLikesCount] = useState(0);
+  const [isLiking, setIsLiking] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [comments, setComments] = useState([]);
   const [newComment, setNewComment] = useState('');
@@ -739,15 +836,24 @@ function PostCard({ post, currentUser, fetchPosts, onOpenProfile }) {
   };
 
   const handleLike = async () => {
+    if (isLiking) return;
+    setIsLiking(true);
+
     if (liked) {
-      await supabase.from('post_likes').delete().eq('post_id', post.id).eq('user_id', currentUser.id);
-      setLiked(false);
-      setLikesCount(prev => prev - 1);
+      const { error } = await supabase.from('post_likes').delete().eq('post_id', post.id).eq('user_id', currentUser.id);
+      if (!error) {
+        setLiked(false);
+        setLikesCount((prev) => Math.max(0, prev - 1));
+      }
     } else {
-      await supabase.from('post_likes').insert([{ post_id: post.id, user_id: currentUser.id }]);
-      setLiked(true);
-      setLikesCount(prev => prev + 1);
+      const { error } = await supabase.from('post_likes').insert([{ post_id: post.id, user_id: currentUser.id }]);
+      if (!error) {
+        setLiked(true);
+        setLikesCount((prev) => prev + 1);
+      }
     }
+
+    setIsLiking(false);
   };
 
   const fetchComments = async () => {
@@ -813,7 +919,7 @@ function PostCard({ post, currentUser, fetchPosts, onOpenProfile }) {
       )}
       
       <div className="flex items-center space-x-6 text-zinc-400 mt-4 pt-4 border-t border-zinc-800/50">
-        <button onClick={handleLike} className={`flex items-center space-x-2 transition-colors ${liked ? 'text-pink-500' : 'hover:text-pink-500'}`}>
+        <button disabled={isLiking} onClick={handleLike} className={`flex items-center space-x-2 transition-colors disabled:opacity-60 ${liked ? 'text-pink-500' : 'hover:text-pink-500'}`}>
           <Heart className={`w-5 h-5 ${liked ? 'fill-current' : ''}`} /> <span>{likesCount}</span>
         </button>
         <button onClick={handleToggleComments} className="flex items-center space-x-2 hover:text-violet-400 transition-colors">
