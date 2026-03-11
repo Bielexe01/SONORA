@@ -37,7 +37,11 @@ const APP_NAV_ITEMS = [
   { id: 'profile', label: 'Perfil', icon: User }
 ];
 
-const getSpotifyRedirectUri = () => `${window.location.origin}/`;
+const getSpotifyRedirectUri = () => {
+  const configured = String(import.meta.env.VITE_SPOTIFY_REDIRECT_URI || '').trim();
+  if (configured) return configured;
+  return `${window.location.origin}/`;
+};
 
 const getSpotifyAuthData = () => {
   try {
