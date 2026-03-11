@@ -29,10 +29,21 @@ create table if not exists public.profiles (
   bio text,
   avatar_url text,
   cover_url text,
+  spotify_capsule jsonb,
+  spotify_capsule_updated_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  constraint profiles_handle_format check (left(handle, 1) = '@')
+  constraint profiles_handle_format check (left(handle, 1) = '@'),
+  constraint profiles_spotify_capsule_is_object check (
+    spotify_capsule is null or jsonb_typeof(spotify_capsule) = 'object'
+  )
 );
+
+alter table if exists public.profiles
+  add column if not exists spotify_capsule jsonb;
+
+alter table if exists public.profiles
+  add column if not exists spotify_capsule_updated_at timestamptz;
 
 create unique index if not exists profiles_handle_unique_ci
   on public.profiles (lower(handle));

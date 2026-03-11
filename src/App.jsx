@@ -37,6 +37,12 @@ const APP_NAV_ITEMS = [
   { id: 'profile', label: 'Perfil', icon: User }
 ];
 
+const SPOTIFY_CAPSULE_PERIODS = [
+  { id: 'short_term', label: '4 semanas' },
+  { id: 'medium_term', label: '6 meses' },
+  { id: 'long_term', label: 'Sempre' }
+];
+
 const getSpotifyRedirectUri = () => {
   const configured = String(import.meta.env.VITE_SPOTIFY_REDIRECT_URI || '').trim();
   if (configured) return configured;
@@ -2704,7 +2710,12 @@ function ProfileView({ user, setUser, viewerUser }) {
   const [isEditing, setIsEditing] = useState(false);
   const [editForm, setEditForm] = useState({ name: user.name, bio: user.bio || '', handle: user.handle });
   const [uploading, setUploading] = useState(false);
-  const [capsuleData, setCapsuleData] = useState(null);
+  const [capsuleData, setCapsuleData] = useState(() => (
+    user?.spotify_capsule && typeof user.spotify_capsule === 'object' ? user.spotify_capsule : null
+  ));
+  const [capsulePeriod, setCapsulePeriod] = useState('short_term');
+  const [syncingCapsule, setSyncingCapsule] = useState(false);
+  const [capsuleSyncMessage, setCapsuleSyncMessage] = useState('');
   const [activeProfileTab, setActiveProfileTab] = useState('posts');
   const [loadingCollections, setLoadingCollections] = useState(true);
   const [collectionsMessage, setCollectionsMessage] = useState('');
@@ -2729,52 +2740,110 @@ function ProfileView({ user, setUser, viewerUser }) {
   }, [user.id, user.name, user.bio, user.handle]);
 
   useEffect(() => {
-    let cancelled = false;
+    const profileCapsule = user?.spotify_capsule && typeof user.spotify_capsule === 'object'
+      ? user.spotify_capsule
+      : null;
+    setCapsuleData(profileCapsule);
+    setCapsuleSyncMessage('');
+    setCapsulePeriod('short_term');
+  }, [user.id, user.spotify_capsule]);
 
-    const loadCapsule = async () => {
-      if (capsuleData) return;
+  const fetchSpotifyJson = async (path, token) => {
+    const response = await fetch(`https://api.spotify.com/v1${path}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!response.ok) throw new Error(`Spotify API falhou em ${path} (${response.status})`);
+    return response.json();
+  };
 
-      try {
-        let accessToken = await getValidSpotifyAccessToken();
-        if (!accessToken) return;
+  const syncSpotifyCapsule = async () => {
+    if (!isOwnProfile) return;
+    if (syncingCapsule) return;
+    if (!hasSpotifyConnection) {
+      setCapsuleSyncMessage('Conecte o Spotify antes de sincronizar.');
+      return;
+    }
 
-        const requestTopArtists = async (token) => fetch('https://api.spotify.com/v1/me/top/artists?limit=4', {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+    setSyncingCapsule(true);
+    setCapsuleSyncMessage('');
 
-        let response = await requestTopArtists(accessToken);
-        if (response.status === 401) {
-          const authData = getSpotifyAuthData();
-          const refreshed = await refreshSpotifyAccessToken(authData?.refresh_token);
-          if (refreshed?.access_token) {
-            const nextAuthData = {
-              ...(authData || {}),
-              access_token: refreshed.access_token,
-              refresh_token: refreshed.refresh_token || authData?.refresh_token || null,
-              scope: refreshed.scope || authData?.scope || '',
-              token_type: refreshed.token_type || authData?.token_type || 'Bearer',
-              expires_at: Date.now() + Number(refreshed.expires_in || 3600) * 1000
-            };
-            setSpotifyAuthData(nextAuthData);
-            accessToken = nextAuthData.access_token;
-            response = await requestTopArtists(accessToken);
-          } else {
-            clearSpotifyAuthData();
-            return;
-          }
-        }
-
-        if (!response.ok) return;
-        const data = await response.json();
-        if (!cancelled && data?.items) setCapsuleData(data.items);
-      } catch (error) {
-        console.error('Erro ao carregar Capsula Spotify:', error);
+    try {
+      const accessToken = await getValidSpotifyAccessToken();
+      if (!accessToken) {
+        setCapsuleSyncMessage('Sessao do Spotify expirada. Conecte novamente.');
+        return;
       }
-    };
 
-    loadCapsule();
-    return () => { cancelled = true; };
-  }, [spotifyToken, capsuleData]);
+      const periodEntries = await Promise.all(
+        SPOTIFY_CAPSULE_PERIODS.map(async (period) => {
+          const [artistsData, tracksData] = await Promise.all([
+            fetchSpotifyJson(`/me/top/artists?limit=5&time_range=${period.id}`, accessToken),
+            fetchSpotifyJson(`/me/top/tracks?limit=50&time_range=${period.id}`, accessToken)
+          ]);
+
+          const topArtists = Array.isArray(artistsData?.items)
+            ? artistsData.items.map((artist) => ({
+                id: artist.id,
+                name: artist.name,
+                image_url: artist.images?.[0]?.url || '',
+                genres: Array.isArray(artist.genres) ? artist.genres.slice(0, 2) : []
+              }))
+            : [];
+
+          const tracks = Array.isArray(tracksData?.items) ? tracksData.items : [];
+          const totalDurationMs = tracks.reduce((sum, track) => sum + Number(track?.duration_ms || 0), 0);
+          const minutes = Math.round(totalDurationMs / 60000);
+
+          return [
+            period.id,
+            {
+              period_label: period.label,
+              artists_count: topArtists.length,
+              tracks_count: tracks.length,
+              minutes_estimate: minutes,
+              top_artists: topArtists
+            }
+          ];
+        })
+      );
+
+      const snapshot = {
+        generated_at: new Date().toISOString(),
+        periods: Object.fromEntries(periodEntries)
+      };
+
+      setCapsuleData(snapshot);
+
+      const updatePayload = {
+        spotify_capsule: snapshot,
+        spotify_capsule_updated_at: snapshot.generated_at
+      };
+
+      const { error: updateError } = await supabase
+        .from('profiles')
+        .update(updatePayload)
+        .eq('id', user.id);
+
+      if (updateError) {
+        setCapsuleSyncMessage('Sincronizada localmente. Falta criar colunas spotify_capsule no banco.');
+      } else {
+        setUser({ ...user, ...updatePayload });
+        setCapsuleSyncMessage('Capsula sincronizada com sucesso.');
+      }
+    } catch (error) {
+      console.error('Erro ao sincronizar Capsula Spotify:', error);
+      setCapsuleSyncMessage('Nao foi possivel sincronizar a Capsula agora.');
+    } finally {
+      setSyncingCapsule(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isOwnProfile) return;
+    if (!hasSpotifyConnection) return;
+    if (capsuleData?.periods) return;
+    syncSpotifyCapsule();
+  }, [isOwnProfile, hasSpotifyConnection, user.id]);
 
   useEffect(() => {
     setIsEditing(false);
@@ -3198,6 +3267,28 @@ function ProfileView({ user, setUser, viewerUser }) {
     return renderAscensaoTab();
   };
 
+  const capsulePeriods = capsuleData?.periods && typeof capsuleData.periods === 'object'
+    ? capsuleData.periods
+    : null;
+  const availableCapsulePeriodIds = SPOTIFY_CAPSULE_PERIODS
+    .map((period) => period.id)
+    .filter((periodId) => Boolean(capsulePeriods?.[periodId]));
+  const activeCapsulePeriod = capsulePeriods?.[capsulePeriod]
+    ? capsulePeriod
+    : (availableCapsulePeriodIds[0] || 'short_term');
+  const selectedCapsulePeriodData = capsulePeriods?.[activeCapsulePeriod]
+    || (capsulePeriods ? capsulePeriods[Object.keys(capsulePeriods)[0]] : null);
+  const capsuleUpdatedAt = user?.spotify_capsule_updated_at || capsuleData?.generated_at || null;
+  const formatMinutes = (minutesValue) => {
+    const totalMinutes = Math.max(0, Number(minutesValue || 0));
+    if (!totalMinutes) return '0 min';
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (!hours) return `${minutes} min`;
+    if (!minutes) return `${hours}h`;
+    return `${hours}h ${minutes}min`;
+  };
+
   return (
     <div className="p-4 md:p-8 max-w-4xl mx-auto">
       <div className="bg-zinc-900 border border-zinc-800 rounded-3xl overflow-hidden relative mb-8 shadow-xl">
@@ -3270,6 +3361,123 @@ function ProfileView({ user, setUser, viewerUser }) {
           {followsMode === 'local' && (
             <p className="text-xs text-zinc-500 mt-2">Contagem em modo local.</p>
           )}
+
+          <div className="mt-6 bg-zinc-950 border border-zinc-800 rounded-2xl p-4 md:p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+              <div>
+                <h3 className="text-base md:text-lg font-bold text-white flex items-center">
+                  <Headphones className="h-5 w-5 mr-2 text-emerald-400" />
+                  Capsula do Tempo Spotify
+                </h3>
+                <p className="text-xs text-zinc-500 mt-1">
+                  {capsuleUpdatedAt
+                    ? `Atualizada em ${new Date(capsuleUpdatedAt).toLocaleString()}`
+                    : 'Ainda sem sincronizacao publica'}
+                </p>
+              </div>
+
+              {isOwnProfile && (
+                <div className="flex flex-wrap items-center gap-2">
+                  {!hasSpotifyConnection && (
+                    <button
+                      type="button"
+                      onClick={handleSpotifyConnect}
+                      className="px-3 py-2 rounded-lg text-sm font-semibold bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+                    >
+                      Conectar Spotify
+                    </button>
+                  )}
+                  {hasSpotifyConnection && (
+                    <button
+                      type="button"
+                      onClick={syncSpotifyCapsule}
+                      disabled={syncingCapsule}
+                      className="px-3 py-2 rounded-lg text-sm font-semibold bg-violet-600 text-white hover:bg-violet-700 disabled:opacity-60"
+                    >
+                      {syncingCapsule ? 'Sincronizando...' : 'Atualizar capsula'}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {isOwnProfile && capsuleSyncMessage && (
+              <p className="text-xs text-zinc-400 mb-3">{capsuleSyncMessage}</p>
+            )}
+
+            {!selectedCapsulePeriodData && (
+              <p className="text-sm text-zinc-500">
+                {isOwnProfile
+                  ? 'Conecte e sincronize seu Spotify para mostrar sua capsula no perfil.'
+                  : 'Este usuario ainda nao publicou a Capsula do Tempo.'}
+              </p>
+            )}
+
+            {selectedCapsulePeriodData && (
+              <div>
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {SPOTIFY_CAPSULE_PERIODS.filter((period) => capsulePeriods?.[period.id]).map((period) => (
+                    <button
+                      key={period.id}
+                      type="button"
+                      onClick={() => setCapsulePeriod(period.id)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                        activeCapsulePeriod === period.id
+                          ? 'bg-violet-600 text-white'
+                          : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                      }`}
+                    >
+                      {period.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-4">
+                  <div className="bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2">
+                    <p className="text-[11px] text-zinc-500 uppercase tracking-wide">Periodo</p>
+                    <p className="text-sm font-semibold text-white mt-1">
+                      {selectedCapsulePeriodData.period_label || 'Resumo'}
+                    </p>
+                  </div>
+                  <div className="bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2">
+                    <p className="text-[11px] text-zinc-500 uppercase tracking-wide">Minutos</p>
+                    <p className="text-sm font-semibold text-white mt-1">
+                      {formatMinutes(selectedCapsulePeriodData.minutes_estimate)}
+                    </p>
+                  </div>
+                  <div className="bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2 col-span-2 md:col-span-1">
+                    <p className="text-[11px] text-zinc-500 uppercase tracking-wide">Faixas / Artistas</p>
+                    <p className="text-sm font-semibold text-white mt-1">
+                      {Number(selectedCapsulePeriodData.tracks_count || 0)} / {Number(selectedCapsulePeriodData.artists_count || 0)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  {(Array.isArray(selectedCapsulePeriodData.top_artists) ? selectedCapsulePeriodData.top_artists : [])
+                    .slice(0, 5)
+                    .map((artist, index) => (
+                      <div key={artist.id || `${artist.name}-${index}`} className="flex items-center gap-3 bg-zinc-900 border border-zinc-800 rounded-xl p-2.5">
+                        <div className="w-7 h-7 rounded-full bg-zinc-800 text-zinc-300 text-xs font-bold flex items-center justify-center shrink-0">
+                          #{index + 1}
+                        </div>
+                        {artist.image_url ? (
+                          <img src={artist.image_url} className="w-9 h-9 rounded-full object-cover bg-zinc-800" />
+                        ) : (
+                          <div className="w-9 h-9 rounded-full bg-zinc-800" />
+                        )}
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold text-white truncate">{artist.name || 'Artista'}</p>
+                          <p className="text-xs text-zinc-500 truncate">
+                            {Array.isArray(artist.genres) && artist.genres.length ? artist.genres.join(' - ') : 'Genero nao informado'}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -3298,35 +3506,6 @@ function ProfileView({ user, setUser, viewerUser }) {
         )}
 
         {renderActiveTabContent()}
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6">
-          <h3 className="text-lg font-bold text-white mb-4 flex items-center"><Headphones className="h-6 w-6 mr-2 text-emerald-500" /> Conexao Spotify</h3>
-          <p className="text-zinc-400 text-sm mb-6">Conecte sua conta para sincronizar a Capsula do Tempo.</p>
-          <button onClick={handleSpotifyConnect} className={`w-full py-3 rounded-xl font-bold flex items-center justify-center transition-colors ${hasSpotifyConnection ? 'bg-zinc-800 text-emerald-500 hover:bg-zinc-700' : 'bg-emerald-500 text-zinc-950 hover:bg-emerald-400'}`}>
-            {hasSpotifyConnection ? <><Check className="w-5 h-5 mr-2" /> Conectado</> : 'Conectar'}
-          </button>
-        </div>
-
-        <div className={`border rounded-2xl p-6 relative overflow-hidden ${hasSpotifyConnection ? 'bg-zinc-900 border-zinc-800' : 'bg-zinc-950 border-zinc-900 opacity-50'}`}>
-          <h3 className="text-lg font-bold text-white mb-4 relative z-10">Capsula do Tempo</h3>
-          {hasSpotifyConnection && capsuleData ? (
-            <div className="relative z-10">
-              <p className="text-xs text-zinc-500 uppercase tracking-wider mb-3">Seus artistas mais ouvidos</p>
-              <div className="space-y-3">
-                {capsuleData.map((artist) => (
-                  <div key={artist.id} className="flex items-center space-x-3 bg-zinc-950 p-2 rounded-lg border border-zinc-800/50">
-                    <img src={artist.images[0]?.url} className="w-10 h-10 rounded-full object-cover" />
-                    <span className="text-sm font-semibold text-white">{artist.name}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <p className="text-zinc-600 text-sm font-medium text-center pt-8">Conecte o Spotify para desbloquear.</p>
-          )}
-        </div>
       </div>
     </div>
   );
