@@ -10,6 +10,7 @@ import {
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.3/+esm';
 import { motion, useMotionValue, useSpring } from 'framer-motion';
 import CommunitiesHub from './CommunitiesHub.jsx';
+import { registerWebPushSubscription, sendWebPushNotifications } from './pushClient.js';
 
 // Inicializacao do Supabase (utilizando as variaveis de ambiente do Vite)
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://vasihzrqjggfbxdmvujc.supabase.co';
@@ -23,7 +24,7 @@ const ASCENSAO_POSTS_STORAGE_KEY = 'sonora_ascensao_posts';
 const ASCENSAO_LIKES_STORAGE_KEY = 'sonora_ascensao_likes';
 const USER_FOLLOWS_STORAGE_KEY = 'sonora_user_follows';
 const COMMUNITY_DEFAULT_GENRES = ['Rock', 'Pop', 'Rap', 'Eletronica', 'Gospel', 'MPB'];
-const AVAILABLE_APP_TABS = new Set(['feed', 'direct', 'communities', 'playlists', 'shopping', 'events', 'notifications', 'ascensao', 'profile']);
+const AVAILABLE_APP_TABS = new Set(['feed', 'direct', 'discover', 'communities', 'playlists', 'shopping', 'events', 'notifications', 'ascensao', 'profile']);
 const SPOTIFY_CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID || '';
 const SPOTIFY_TOKEN_STORAGE_KEY = 'spotify_token';
 const SPOTIFY_AUTH_DATA_STORAGE_KEY = 'sonora_spotify_auth_data';
@@ -32,6 +33,7 @@ const SPOTIFY_PKCE_STATE_STORAGE_KEY = 'sonora_spotify_pkce_state';
 const APP_NAV_ITEMS = [
   { id: 'feed', label: 'Feed', icon: Home },
   { id: 'direct', label: 'Direct', icon: MessageCircle },
+  { id: 'discover', label: 'Busca', icon: Search },
   { id: 'communities', label: 'Comunidades', icon: Users },
   { id: 'playlists', label: 'Playlists', icon: ListMusic },
   { id: 'shopping', label: 'Shopping', icon: ShoppingBag },
@@ -40,6 +42,7 @@ const APP_NAV_ITEMS = [
   { id: 'ascensao', label: 'Ascensao', icon: TrendingUp },
   { id: 'profile', label: 'Perfil', icon: User }
 ];
+const NATIVE_NOTIFICATIONS_PROMPT_KEY = 'sonora_native_notifications_prompted';
 
 const SPOTIFY_CAPSULE_PERIODS = [
   { id: 'short_term', label: '4 semanas' },
@@ -74,6 +77,23 @@ const clearSpotifyAuthData = () => {
   window.localStorage.removeItem(SPOTIFY_TOKEN_STORAGE_KEY);
   window.localStorage.removeItem(SPOTIFY_PKCE_VERIFIER_STORAGE_KEY);
   window.localStorage.removeItem(SPOTIFY_PKCE_STATE_STORAGE_KEY);
+};
+
+const formatNotificationBadge = (count) => (count > 99 ? '99+' : String(count));
+
+const requestNativeNotificationPermissionOnce = async () => {
+  if (typeof window === 'undefined' || !('Notification' in window)) return;
+  if (Notification.permission !== 'default') return;
+
+  const prompted = window.localStorage.getItem(NATIVE_NOTIFICATIONS_PROMPT_KEY) === '1';
+  if (prompted) return;
+
+  window.localStorage.setItem(NATIVE_NOTIFICATIONS_PROMPT_KEY, '1');
+  try {
+    await Notification.requestPermission();
+  } catch {
+    // noop
+  }
 };
 
 const createRandomString = (length = 64) => {
@@ -303,6 +323,20 @@ const parseLocalDateTimeToIso = (localDateTime) => {
   return parsedDate.toISOString();
 };
 
+const isoToLocalDateTimeInputValue = (isoDateTime) => {
+  if (!isoDateTime) return '';
+  const parsedDate = new Date(isoDateTime);
+  if (Number.isNaN(parsedDate.getTime())) return '';
+
+  const pad = (value) => String(value).padStart(2, '0');
+  const year = parsedDate.getFullYear();
+  const month = pad(parsedDate.getMonth() + 1);
+  const day = pad(parsedDate.getDate());
+  const hour = pad(parsedDate.getHours());
+  const minute = pad(parsedDate.getMinutes());
+  return `${year}-${month}-${day}T${hour}:${minute}`;
+};
+
 const buildGoogleMapsSearchUrl = (rawAddress) => {
   const address = String(rawAddress || '').trim();
   if (!address) return '';
@@ -410,7 +444,7 @@ const createNotification = async ({
   if (!recipient || !actor || !type || !title) return;
   if (recipient === actor) return;
 
-  await supabase.from('notifications').insert([{
+  const { data, error } = await supabase.from('notifications').insert([{
     recipient_id: recipient,
     actor_id: actor,
     type,
@@ -419,7 +453,15 @@ const createNotification = async ({
     entity_type: entityType || null,
     entity_id: entityId ? String(entityId) : null,
     metadata: metadata && typeof metadata === 'object' ? metadata : {}
-  }]);
+  }]).select('id');
+
+  if (error) return;
+  const notificationIds = (data || [])
+    .map((item) => item?.id)
+    .filter((id) => id !== null && id !== undefined);
+  if (notificationIds.length) {
+    await sendWebPushNotifications({ supabase, notificationIds });
+  }
 };
 
 const createNotificationsBulk = async (entries) => {
@@ -445,7 +487,15 @@ const createNotificationsBulk = async (entries) => {
     .filter(Boolean);
 
   if (!payload.length) return;
-  await supabase.from('notifications').insert(payload);
+  const { data, error } = await supabase.from('notifications').insert(payload).select('id');
+  if (error) return;
+
+  const notificationIds = (data || [])
+    .map((item) => item?.id)
+    .filter((id) => id !== null && id !== undefined);
+  if (notificationIds.length) {
+    await sendWebPushNotifications({ supabase, notificationIds });
+  }
 };
 
 const getLocalCommunityMembershipState = (userId) => {
@@ -639,6 +689,8 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [selectedProfile, setSelectedProfile] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [unreadNotificationsCount, setUnreadNotificationsCount] = useState(0);
+  const deliveredNativeNotificationIdsRef = useRef(new Set());
 
   useEffect(() => {
     const processSpotifyCallback = async () => {
@@ -795,6 +847,74 @@ export default function App() {
     if (tabId === 'profile') setSelectedProfile(currentUser);
     setActiveTab(tabId);
   };
+
+  useEffect(() => {
+    if (!currentUser?.id) return;
+    registerWebPushSubscription({ supabase, userId: currentUser.id });
+  }, [currentUser?.id]);
+
+  useEffect(() => {
+    if (!currentUser?.id) {
+      setUnreadNotificationsCount(0);
+      deliveredNativeNotificationIdsRef.current = new Set();
+      return;
+    }
+
+    const fetchUnreadNotificationsCount = async () => {
+      const { count, error } = await supabase
+        .from('notifications')
+        .select('id', { count: 'exact', head: true })
+        .eq('recipient_id', currentUser.id)
+        .eq('is_read', false);
+
+      if (!error) setUnreadNotificationsCount(count || 0);
+    };
+
+    const maybeDeliverNativeNotification = (row) => {
+      if (!row?.id) return;
+      if (typeof window === 'undefined' || !('Notification' in window)) return;
+      if (Notification.permission !== 'granted') return;
+
+      if (deliveredNativeNotificationIdsRef.current.has(row.id)) return;
+      deliveredNativeNotificationIdsRef.current.add(row.id);
+
+      if (document.visibilityState === 'visible' && document.hasFocus()) return;
+
+      const nativeNotification = new Notification(row.title || 'Nova notificacao', {
+        body: row.body || 'Abra o Sonora para ver os detalhes.',
+        icon: `${window.location.origin}/favicon.ico`,
+        badge: `${window.location.origin}/favicon.ico`,
+        tag: `sonora-notification-${row.id}`
+      });
+
+      nativeNotification.onclick = () => {
+        window.focus();
+        setActiveTab('notifications');
+        nativeNotification.close();
+      };
+    };
+
+    fetchUnreadNotificationsCount();
+    requestNativeNotificationPermissionOnce();
+
+    const channel = supabase
+      .channel(`notifications-global-${currentUser.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications', filter: `recipient_id=eq.${currentUser.id}` }, (payload) => {
+        if (payload?.eventType === 'INSERT') maybeDeliverNativeNotification(payload.new);
+        fetchUnreadNotificationsCount();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [currentUser?.id]);
+
+  const navItems = APP_NAV_ITEMS.map((item) => (
+    item.id === 'notifications'
+      ? { ...item, badgeCount: unreadNotificationsCount }
+      : item
+  ));
   
   if (isLoading) {
     return (
@@ -832,12 +952,13 @@ export default function App() {
           </div>
           
           <div className="space-y-2 px-3">
-            {APP_NAV_ITEMS.map((item) => (
+            {navItems.map((item) => (
               <NavItem
                 key={item.id}
                 icon={React.createElement(item.icon)}
                 label={item.label}
                 active={activeTab === item.id}
+                badgeCount={item.badgeCount || 0}
                 onClick={() => handleTabChange(item.id)}
               />
             ))}
@@ -855,11 +976,19 @@ export default function App() {
         <div className={`${activeTab === 'direct' || activeTab === 'communities' ? 'w-full' : 'max-w-4xl mx-auto'} min-h-full`}>
           {activeTab === 'feed' && <FeedView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'direct' && <DirectView currentUser={currentUser} onOpenProfile={openProfile} />}
+          {activeTab === 'discover' && <DiscoverView currentUser={currentUser} onOpenProfile={openProfile} onNavigate={handleTabChange} />}
           {activeTab === 'communities' && <CommunitiesHub currentUser={currentUser} onOpenDirect={() => setActiveTab('direct')} onOpenProfile={openProfile} />}
           {activeTab === 'playlists' && <PlaylistsView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'shopping' && <ShoppingView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'events' && <EventsView currentUser={currentUser} onOpenProfile={openProfile} />}
-          {activeTab === 'notifications' && <NotificationsView currentUser={currentUser} onOpenProfile={openProfile} onNavigate={handleTabChange} />}
+          {activeTab === 'notifications' && (
+            <NotificationsView
+              currentUser={currentUser}
+              onOpenProfile={openProfile}
+              onNavigate={handleTabChange}
+              onUnreadCountChange={setUnreadNotificationsCount}
+            />
+          )}
           {activeTab === 'ascensao' && <AscensaoView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'profile' && (
             <ProfileView
@@ -876,7 +1005,7 @@ export default function App() {
       </main>
 
       <MobileBottomNav
-        items={APP_NAV_ITEMS}
+        items={navItems}
         activeTab={activeTab}
         onSelect={handleTabChange}
       />
@@ -2378,6 +2507,21 @@ function ShoppingView({ currentUser, onOpenProfile }) {
   const [chatLoading, setChatLoading] = useState(false);
   const [chatSending, setChatSending] = useState(false);
   const [mapModal, setMapModal] = useState({ open: false, title: '', query: '' });
+  const [editingListingId, setEditingListingId] = useState(null);
+  const [listingEditSaving, setListingEditSaving] = useState(false);
+  const [listingEditDraft, setListingEditDraft] = useState({
+    title: '',
+    description: '',
+    price: '',
+    condition: 'used',
+    category: '',
+    location: '',
+    purchase_url: '',
+    image_url: '',
+    image_position_x: 50,
+    image_position_y: 50,
+    status: 'available'
+  });
   const [newItem, setNewItem] = useState({
     title: '',
     description: '',
@@ -2595,6 +2739,100 @@ function ShoppingView({ currentUser, onOpenProfile }) {
     await fetchListings();
   };
 
+  const resetListingEditDraft = () => {
+    setListingEditDraft({
+      title: '',
+      description: '',
+      price: '',
+      condition: 'used',
+      category: '',
+      location: '',
+      purchase_url: '',
+      image_url: '',
+      image_position_x: 50,
+      image_position_y: 50,
+      status: 'available'
+    });
+  };
+
+  const handleStartEditListing = (listing) => {
+    if (!listing || normalizeId(listing.seller_id) !== normalizeId(currentUser.id)) return;
+    setErrorMessage('');
+    setEditingListingId(listing.id);
+    setListingEditDraft({
+      title: listing.title || '',
+      description: listing.description || '',
+      price: listing.price !== null && listing.price !== undefined ? String(listing.price) : '',
+      condition: listing.condition === 'new' ? 'new' : 'used',
+      category: listing.category || '',
+      location: listing.location || '',
+      purchase_url: listing.purchase_url || '',
+      image_url: listing.image_url || '',
+      image_position_x: clampPercent(listing.image_position_x, 50),
+      image_position_y: clampPercent(listing.image_position_y, 50),
+      status: listing.status === 'sold' ? 'sold' : 'available'
+    });
+  };
+
+  const handleCancelEditListing = () => {
+    if (listingEditSaving) return;
+    setEditingListingId(null);
+    resetListingEditDraft();
+  };
+
+  const handleSaveListingEdit = async (event, listingId) => {
+    event.preventDefault();
+    if (listingEditSaving) return;
+
+    const title = listingEditDraft.title.trim();
+    const description = listingEditDraft.description.trim();
+    const price = Number(String(listingEditDraft.price).replace(',', '.'));
+    const condition = listingEditDraft.condition === 'new' ? 'new' : 'used';
+    const category = listingEditDraft.category.trim();
+    const location = listingEditDraft.location.trim();
+    const purchaseUrl = listingEditDraft.purchase_url.trim();
+    const imageUrl = listingEditDraft.image_url.trim();
+    const imagePositionX = clampPercent(listingEditDraft.image_position_x, 50);
+    const imagePositionY = clampPercent(listingEditDraft.image_position_y, 50);
+    const status = listingEditDraft.status === 'sold' ? 'sold' : 'available';
+
+    if (!title || !Number.isFinite(price) || price < 0) {
+      setErrorMessage('Preencha titulo e preco valido para editar o anuncio.');
+      return;
+    }
+
+    setListingEditSaving(true);
+    setErrorMessage('');
+    const { error } = await supabase
+      .from('marketplace_listings')
+      .update({
+        title,
+        description: description || null,
+        price,
+        condition,
+        category: category || null,
+        location: location || null,
+        purchase_url: purchaseUrl || null,
+        image_url: imageUrl || null,
+        image_position_x: imagePositionX,
+        image_position_y: imagePositionY,
+        status
+      })
+      .eq('id', listingId)
+      .eq('seller_id', currentUser.id);
+
+    if (error) {
+      setErrorMessage(`Nao foi possivel editar o anuncio (${error.message || 'erro desconhecido'}).`);
+      setListingEditSaving(false);
+      return;
+    }
+
+    setListingEditSaving(false);
+    setEditingListingId(null);
+    resetListingEditDraft();
+    await fetchListings();
+  };
+
   const handleDeleteListing = async (listingId) => {
     if (!window.confirm('Deseja remover este anuncio?')) return;
     setDeletingId(listingId);
@@ -2613,6 +2851,10 @@ function ShoppingView({ currentUser, onOpenProfile }) {
       setChatSending(false);
     }
     setDeletingId(null);
+    if (normalizeId(editingListingId) === normalizeId(listingId)) {
+      setEditingListingId(null);
+      resetListingEditDraft();
+    }
     await fetchListings();
   };
 
@@ -3078,6 +3320,16 @@ function ShoppingView({ currentUser, onOpenProfile }) {
                     {item.status === 'sold' ? 'Vendido' : 'Disponivel'}
                   </span>
                   {item.seller_id === currentUser.id && (
+                    <button
+                      type="button"
+                      onClick={() => handleStartEditListing(item)}
+                      className="text-zinc-500 hover:text-violet-300"
+                      title="Editar anuncio"
+                    >
+                      <Edit3 className="w-4 h-4" />
+                    </button>
+                  )}
+                  {item.seller_id === currentUser.id && (
                     <button disabled={deletingId === item.id} onClick={() => handleDeleteListing(item.id)} className="text-zinc-500 hover:text-red-400 disabled:opacity-50" title="Remover anuncio">
                       <Trash2 className="w-4 h-4" />
                     </button>
@@ -3099,6 +3351,45 @@ function ShoppingView({ currentUser, onOpenProfile }) {
                   {favoriteCountMap[normalizeId(item.id)] || 0}
                 </button>
               </div>
+              {item.seller_id === currentUser.id && normalizeId(editingListingId) === normalizeId(item.id) && (
+                <form onSubmit={(event) => handleSaveListingEdit(event, item.id)} className="mt-3 rounded-xl border border-zinc-800 bg-zinc-950 p-3 space-y-2">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    <input type="text" required value={listingEditDraft.title} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, title: event.target.value }))} placeholder="Titulo do anuncio" className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                    <input type="text" required value={listingEditDraft.price} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, price: event.target.value }))} placeholder="Preco" className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                    <select value={listingEditDraft.condition} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, condition: event.target.value }))} className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500">
+                      <option value="used">Usado</option>
+                      <option value="new">Novo</option>
+                    </select>
+                    <select value={listingEditDraft.status} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, status: event.target.value }))} className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500">
+                      <option value="available">Disponivel</option>
+                      <option value="sold">Vendido</option>
+                    </select>
+                    <input type="text" value={listingEditDraft.category} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, category: event.target.value }))} placeholder="Categoria" className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                    <input type="text" value={listingEditDraft.location} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, location: event.target.value }))} placeholder="Cidade / Estado" className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                  </div>
+                  <input type="text" value={listingEditDraft.purchase_url} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, purchase_url: event.target.value }))} placeholder="Link de compra/contato" className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                  <input type="text" value={listingEditDraft.image_url} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, image_url: event.target.value }))} placeholder="URL da imagem" className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    <label className="text-[11px] text-zinc-400">
+                      Posicao horizontal ({clampPercent(listingEditDraft.image_position_x, 50)}%)
+                      <input type="range" min="0" max="100" value={clampPercent(listingEditDraft.image_position_x, 50)} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, image_position_x: Number(event.target.value) }))} className="w-full mt-1" />
+                    </label>
+                    <label className="text-[11px] text-zinc-400">
+                      Posicao vertical ({clampPercent(listingEditDraft.image_position_y, 50)}%)
+                      <input type="range" min="0" max="100" value={clampPercent(listingEditDraft.image_position_y, 50)} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, image_position_y: Number(event.target.value) }))} className="w-full mt-1" />
+                    </label>
+                  </div>
+                  <textarea value={listingEditDraft.description} onChange={(event) => setListingEditDraft((prev) => ({ ...prev, description: event.target.value }))} rows={3} placeholder="Descricao" className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500 resize-none" />
+                  <div className="flex flex-wrap gap-2">
+                    <button type="submit" disabled={listingEditSaving} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white disabled:opacity-60">
+                      {listingEditSaving ? 'Salvando...' : 'Salvar edicao'}
+                    </button>
+                    <button type="button" onClick={handleCancelEditListing} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">
+                      Cancelar
+                    </button>
+                  </div>
+                </form>
+              )}
               {item.description && <p className="text-sm text-zinc-300 mt-3 line-clamp-3">{item.description}</p>}
               <div className="mt-4 flex items-center justify-between gap-2">
                 <button type="button" onClick={() => item.profiles?.id && onOpenProfile?.(item.profiles)} className="text-xs text-zinc-400 hover:text-violet-300 transition-colors">
@@ -3248,6 +3539,27 @@ function EventsView({ currentUser, onOpenProfile }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [artistFilter, setArtistFilter] = useState('all');
   const [deletingId, setDeletingId] = useState(null);
+  const [rsvpLoadingEventId, setRsvpLoadingEventId] = useState(null);
+  const [applicationDrafts, setApplicationDrafts] = useState({});
+  const [applicationLoadingEventId, setApplicationLoadingEventId] = useState(null);
+  const [applicationReviewId, setApplicationReviewId] = useState(null);
+  const [editingEventId, setEditingEventId] = useState(null);
+  const [eventEditSaving, setEventEditSaving] = useState(false);
+  const [eventEditDraft, setEventEditDraft] = useState({
+    title: '',
+    description: '',
+    event_date: '',
+    venue: '',
+    city: '',
+    genre: '',
+    ticket_url: '',
+    contact_url: '',
+    needs_artists: false,
+    artist_requirements: '',
+    cover_url: '',
+    cover_position_x: 50,
+    cover_position_y: 50
+  });
   const [mapModal, setMapModal] = useState({ open: false, title: '', query: '' });
   const [newEvent, setNewEvent] = useState({
     title: '',
@@ -3277,10 +3589,52 @@ function EventsView({ currentUser, onOpenProfile }) {
     setErrorMessage('');
     const blockedUsers = await buildBlockedUserIdSet(currentUser.id);
 
-    const { data, error } = await supabase
+    const fullQuery = await supabase
       .from('music_events')
-      .select('*, profiles!music_events_organizer_id_fkey(id, name, handle, avatar_url)')
+      .select(`
+        *,
+        profiles!music_events_organizer_id_fkey(id, name, handle, avatar_url),
+        event_rsvps(
+          id,
+          event_id,
+          user_id,
+          status,
+          created_at,
+          profiles!event_rsvps_user_id_fkey(id, name, handle, avatar_url)
+        ),
+        event_artist_applications(
+          id,
+          event_id,
+          artist_id,
+          message,
+          portfolio_url,
+          status,
+          reviewed_at,
+          reviewed_by,
+          created_at,
+          profiles!event_artist_applications_artist_id_fkey(id, name, handle, avatar_url)
+        )
+      `)
       .order('event_date', { ascending: true });
+    let data = fullQuery.data;
+    let error = fullQuery.error;
+
+    if (error) {
+      const fallbackQuery = await supabase
+        .from('music_events')
+        .select('*, profiles!music_events_organizer_id_fkey(id, name, handle, avatar_url)')
+        .order('event_date', { ascending: true });
+
+      data = (fallbackQuery.data || []).map((item) => ({
+        ...item,
+        event_rsvps: [],
+        event_artist_applications: []
+      }));
+      error = fallbackQuery.error;
+      if (!error) {
+        setErrorMessage('Atualize o schema para habilitar RSVP e candidaturas de artistas.');
+      }
+    }
 
     if (error) {
       setErrorMessage('Nao foi possivel carregar eventos. Verifique a tabela music_events no banco.');
@@ -3290,7 +3644,17 @@ function EventsView({ currentUser, onOpenProfile }) {
     }
 
     setEvents(
-      (data || []).filter((item) => !blockedUsers.has(normalizeId(item.organizer_id)))
+      (data || [])
+        .filter((item) => !blockedUsers.has(normalizeId(item.organizer_id)))
+        .map((item) => ({
+          ...item,
+          event_rsvps: Array.isArray(item.event_rsvps)
+            ? item.event_rsvps.filter((entry) => !blockedUsers.has(normalizeId(entry.user_id)))
+            : [],
+          event_artist_applications: Array.isArray(item.event_artist_applications)
+            ? item.event_artist_applications.filter((entry) => !blockedUsers.has(normalizeId(entry.artist_id)))
+            : []
+        }))
     );
     setLoading(false);
   };
@@ -3419,7 +3783,280 @@ function EventsView({ currentUser, onOpenProfile }) {
       return;
     }
     setDeletingId(null);
+    if (normalizeId(editingEventId) === normalizeId(eventId)) {
+      setEditingEventId(null);
+    }
     await fetchEvents();
+  };
+
+  const resetEventEditDraft = () => {
+    setEventEditDraft({
+      title: '',
+      description: '',
+      event_date: '',
+      venue: '',
+      city: '',
+      genre: '',
+      ticket_url: '',
+      contact_url: '',
+      needs_artists: false,
+      artist_requirements: '',
+      cover_url: '',
+      cover_position_x: 50,
+      cover_position_y: 50
+    });
+  };
+
+  const handleStartEditEvent = (item) => {
+    if (!item || normalizeId(item.organizer_id) !== normalizeId(currentUser.id)) return;
+    setErrorMessage('');
+    setEditingEventId(item.id);
+    setEventEditDraft({
+      title: item.title || '',
+      description: item.description || '',
+      event_date: isoToLocalDateTimeInputValue(item.event_date),
+      venue: item.venue || '',
+      city: item.city || '',
+      genre: item.genre || '',
+      ticket_url: item.ticket_url || '',
+      contact_url: item.contact_url || '',
+      needs_artists: Boolean(item.needs_artists),
+      artist_requirements: item.artist_requirements || '',
+      cover_url: item.cover_url || '',
+      cover_position_x: clampPercent(item.cover_position_x, 50),
+      cover_position_y: clampPercent(item.cover_position_y, 50)
+    });
+  };
+
+  const handleCancelEditEvent = () => {
+    if (eventEditSaving) return;
+    setEditingEventId(null);
+    resetEventEditDraft();
+  };
+
+  const handleSaveEventEdit = async (event, eventId) => {
+    event.preventDefault();
+    if (eventEditSaving) return;
+
+    const title = eventEditDraft.title.trim();
+    const description = eventEditDraft.description.trim();
+    const venue = eventEditDraft.venue.trim();
+    const city = eventEditDraft.city.trim();
+    const genre = eventEditDraft.genre.trim();
+    const ticketUrl = eventEditDraft.ticket_url.trim();
+    const contactUrl = eventEditDraft.contact_url.trim();
+    const artistRequirements = eventEditDraft.artist_requirements.trim();
+    const eventDateIso = parseLocalDateTimeToIso(eventEditDraft.event_date);
+    const eventTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+    const coverUrl = eventEditDraft.cover_url.trim();
+    const coverPositionX = clampPercent(eventEditDraft.cover_position_x, 50);
+    const coverPositionY = clampPercent(eventEditDraft.cover_position_y, 50);
+
+    if (!title || !venue || !city || !eventDateIso || Number.isNaN(new Date(eventDateIso).getTime())) {
+      setErrorMessage('Preencha titulo, data, local e cidade para editar o evento.');
+      return;
+    }
+
+    setEventEditSaving(true);
+    setErrorMessage('');
+    const { error } = await supabase
+      .from('music_events')
+      .update({
+        title,
+        description: description || null,
+        event_date: eventDateIso,
+        venue,
+        city,
+        genre: genre || null,
+        ticket_url: ticketUrl || null,
+        contact_url: contactUrl || null,
+        needs_artists: Boolean(eventEditDraft.needs_artists),
+        artist_requirements: eventEditDraft.needs_artists ? (artistRequirements || null) : null,
+        cover_url: coverUrl || null,
+        cover_position_x: coverPositionX,
+        cover_position_y: coverPositionY,
+        event_timezone: eventTimezone
+      })
+      .eq('id', eventId)
+      .eq('organizer_id', currentUser.id);
+
+    if (error) {
+      setErrorMessage(`Nao foi possivel editar o evento (${error.message || 'erro desconhecido'}).`);
+      setEventEditSaving(false);
+      return;
+    }
+
+    setEventEditSaving(false);
+    setEditingEventId(null);
+    resetEventEditDraft();
+    await fetchEvents();
+  };
+
+  const updateApplicationDraft = (eventId, field, value) => {
+    setApplicationDrafts((prev) => ({
+      ...prev,
+      [eventId]: {
+        ...(prev[eventId] || { message: '', portfolio_url: '' }),
+        [field]: value
+      }
+    }));
+  };
+
+  const handleToggleRsvp = async ({ eventId, hasRsvp, organizerId, eventTitle }) => {
+    if (!eventId || rsvpLoadingEventId === eventId) return;
+    setRsvpLoadingEventId(eventId);
+    setErrorMessage('');
+
+    if (hasRsvp) {
+      const { error } = await supabase
+        .from('event_rsvps')
+        .delete()
+        .eq('event_id', eventId)
+        .eq('user_id', currentUser.id);
+      if (error) {
+        setErrorMessage('Nao foi possivel atualizar seu RSVP.');
+        setRsvpLoadingEventId(null);
+        return;
+      }
+      await fetchEvents();
+      setRsvpLoadingEventId(null);
+      return;
+    }
+
+    const { error } = await supabase.from('event_rsvps').insert([{
+      event_id: eventId,
+      user_id: currentUser.id,
+      status: 'going'
+    }]);
+
+    if (error) {
+      setErrorMessage(error.code === '23505' ? 'Voce ja confirmou presenca neste evento.' : 'Nao foi possivel confirmar presenca.');
+      setRsvpLoadingEventId(null);
+      return;
+    }
+
+    await createNotification({
+      recipientId: organizerId,
+      actorId: currentUser.id,
+      type: 'event_new',
+      title: `${currentUser.name || 'Um usuario'} confirmou presenca`,
+      body: eventTitle ? `Evento: ${eventTitle}` : null,
+      entityType: 'event',
+      entityId: eventId
+    });
+
+    await fetchEvents();
+    setRsvpLoadingEventId(null);
+  };
+
+  const handleSubmitArtistApplication = async ({ eventId, organizerId, eventTitle }) => {
+    if (!eventId || applicationLoadingEventId === eventId) return;
+    const draft = applicationDrafts[eventId] || { message: '', portfolio_url: '' };
+    const message = String(draft.message || '').trim();
+    const portfolioUrl = String(draft.portfolio_url || '').trim();
+
+    if (!message && !portfolioUrl) {
+      setErrorMessage('Escreva uma mensagem ou informe um link de portfolio para se candidatar.');
+      return;
+    }
+
+    setApplicationLoadingEventId(eventId);
+    setErrorMessage('');
+
+    const { error } = await supabase.from('event_artist_applications').upsert([{
+      event_id: eventId,
+      artist_id: currentUser.id,
+      message: message || null,
+      portfolio_url: portfolioUrl || null,
+      status: 'pending',
+      reviewed_at: null,
+      reviewed_by: null
+    }], {
+      onConflict: 'event_id,artist_id'
+    });
+
+    if (error) {
+      if (error.code === '42501') {
+        setErrorMessage('Sem permissao para candidatar. Atualize as policies de event_artist_applications no Supabase.');
+      } else {
+        setErrorMessage(`Nao foi possivel enviar sua candidatura (${error.message || 'erro desconhecido'}).`);
+      }
+      setApplicationLoadingEventId(null);
+      return;
+    }
+
+    await createNotification({
+      recipientId: organizerId,
+      actorId: currentUser.id,
+      type: 'event_new',
+      title: `${currentUser.name || 'Um artista'} enviou candidatura`,
+      body: eventTitle ? `Evento: ${eventTitle}` : null,
+      entityType: 'event',
+      entityId: eventId
+    });
+
+    setApplicationDrafts((prev) => ({ ...prev, [eventId]: { message: '', portfolio_url: '' } }));
+    await fetchEvents();
+    setApplicationLoadingEventId(null);
+  };
+
+  const handleWithdrawArtistApplication = async (applicationId) => {
+    if (!applicationId) return;
+    if (!window.confirm('Deseja retirar sua candidatura?')) return;
+
+    const { error } = await supabase
+      .from('event_artist_applications')
+      .delete()
+      .eq('id', applicationId)
+      .eq('artist_id', currentUser.id);
+
+    if (error) {
+      setErrorMessage('Nao foi possivel retirar a candidatura.');
+      return;
+    }
+
+    await fetchEvents();
+  };
+
+  const handleReviewArtistApplication = async ({ applicationId, nextStatus, artistId, eventId, eventTitle }) => {
+    if (!applicationId || !nextStatus || applicationReviewId === applicationId) return;
+    setApplicationReviewId(applicationId);
+    setErrorMessage('');
+
+    const { error } = await supabase
+      .from('event_artist_applications')
+      .update({
+        status: nextStatus,
+        reviewed_at: new Date().toISOString(),
+        reviewed_by: currentUser.id
+      })
+      .eq('id', applicationId);
+
+    if (error) {
+      setErrorMessage('Nao foi possivel atualizar o status da candidatura.');
+      setApplicationReviewId(null);
+      return;
+    }
+
+    const statusLabel = nextStatus === 'accepted' ? 'aceita' : nextStatus === 'rejected' ? 'recusada' : 'atualizada';
+    await createNotification({
+      recipientId: artistId,
+      actorId: currentUser.id,
+      type: 'event_new',
+      title: `Sua candidatura foi ${statusLabel}`,
+      body: eventTitle ? `Evento: ${eventTitle}` : null,
+      entityType: 'event',
+      entityId: eventId
+    });
+
+    await fetchEvents();
+    setApplicationReviewId(null);
+  };
+
+  const getApplicationStatusUi = (status) => {
+    if (status === 'accepted') return { label: 'Aceita', className: 'bg-emerald-500/20 text-emerald-300' };
+    if (status === 'rejected') return { label: 'Recusada', className: 'bg-red-500/20 text-red-300' };
+    return { label: 'Pendente', className: 'bg-amber-500/20 text-amber-300' };
   };
 
   const filteredEvents = events.filter((item) => {
@@ -3580,64 +4217,325 @@ function EventsView({ currentUser, onOpenProfile }) {
       <div className="space-y-4">
         {loading && <p className="text-sm text-zinc-500">Carregando eventos...</p>}
         {!loading && filteredEvents.length === 0 && <p className="text-sm text-zinc-500">Nenhum evento encontrado.</p>}
-        {!loading && filteredEvents.map((item) => (
-          <div key={item.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
-            {item.cover_url && (
-              <img
-                src={item.cover_url}
-                className="w-full h-44 object-cover bg-zinc-950"
-                style={{ objectPosition: `${clampPercent(item.cover_position_x, 50)}% ${clampPercent(item.cover_position_y, 50)}%` }}
-              />
-            )}
-            <div className="p-4 md:p-5">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <h3 className="text-lg font-bold text-white">{item.title}</h3>
-                  <p className="text-sm text-zinc-400 mt-1">{formatEventDate(item.event_date, item.event_timezone)} • {item.venue}, {item.city}</p>
-                </div>
-                {item.organizer_id === currentUser.id && (
-                  <button disabled={deletingId === item.id} onClick={() => handleDeleteEvent(item.id)} className="text-zinc-500 hover:text-red-400 disabled:opacity-50" title="Remover evento">
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                )}
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2 text-[11px]">
-                {item.genre && <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-300">{item.genre}</span>}
-                {item.needs_artists ? <span className="px-2 py-1 rounded-md bg-emerald-500/20 text-emerald-300">Precisa de artistas</span> : <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-400">Sem vagas para artistas</span>}
-              </div>
-              {item.description && <p className="text-sm text-zinc-300 mt-3 whitespace-pre-wrap">{item.description}</p>}
-              {item.needs_artists && item.artist_requirements && (
-                <div className="mt-3 bg-zinc-950 border border-zinc-800 rounded-xl p-3">
-                  <p className="text-xs text-emerald-300 font-semibold mb-1">Requisitos para artistas</p>
-                  <p className="text-sm text-zinc-300 whitespace-pre-wrap">{item.artist_requirements}</p>
-                </div>
+        {!loading && filteredEvents.map((item) => {
+          const isOrganizer = normalizeId(item.organizer_id) === normalizeId(currentUser.id);
+          const interestedUsers = [...(Array.isArray(item.event_rsvps) ? item.event_rsvps : [])]
+            .sort((a, b) => new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime());
+          const hasRsvp = interestedUsers.some((entry) => normalizeId(entry.user_id) === normalizeId(currentUser.id));
+          const artistsApplications = [...(Array.isArray(item.event_artist_applications) ? item.event_artist_applications : [])]
+            .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+          const myApplication = artistsApplications.find((entry) => normalizeId(entry.artist_id) === normalizeId(currentUser.id)) || null;
+          const draft = applicationDrafts[item.id] || { message: '', portfolio_url: '' };
+
+          return (
+            <div key={item.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
+              {item.cover_url && (
+                <img
+                  src={item.cover_url}
+                  className="w-full h-44 object-cover bg-zinc-950"
+                  style={{ objectPosition: `${clampPercent(item.cover_position_x, 50)}% ${clampPercent(item.cover_position_y, 50)}%` }}
+                />
               )}
-              <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
-                <button type="button" onClick={() => item.profiles?.id && onOpenProfile?.(item.profiles)} className="text-xs text-zinc-400 hover:text-violet-300 transition-colors">
-                  Organizador: {item.profiles?.name || 'Usuario'} {item.profiles?.handle || ''}
-                </button>
-                <div className="flex flex-wrap gap-2">
-                  {(item.venue || item.city) && (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => openMapModal(item.title || 'Local do evento', `${item.venue || ''}, ${item.city || ''}`)}
-                        className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100"
-                      >
-                        Maps
+              <div className="p-4 md:p-5">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="text-lg font-bold text-white">{item.title}</h3>
+                    <p className="text-sm text-zinc-400 mt-1">{formatEventDate(item.event_date, item.event_timezone)} • {item.venue}, {item.city}</p>
+                  </div>
+                  {isOrganizer && (
+                    <div className="flex items-center gap-2">
+                      <button type="button" onClick={() => handleStartEditEvent(item)} className="text-zinc-500 hover:text-violet-300" title="Editar evento">
+                        <Edit3 className="w-4 h-4" />
                       </button>
-                      <a href={buildGoogleMapsSearchUrl(`${item.venue || ''}, ${item.city || ''}`)} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-zinc-200">
-                        Abrir
-                      </a>
-                    </>
+                      <button disabled={deletingId === item.id} onClick={() => handleDeleteEvent(item.id)} className="text-zinc-500 hover:text-red-400 disabled:opacity-50" title="Remover evento">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
                   )}
-                  {item.ticket_url && <a href={item.ticket_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm font-semibold px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white"><Ticket className="w-4 h-4" />Ingressos</a>}
-                  {item.contact_url && <a href={item.contact_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">Contato</a>}
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2 text-[11px]">
+                  {item.genre && <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-300">{item.genre}</span>}
+                  {item.needs_artists ? <span className="px-2 py-1 rounded-md bg-emerald-500/20 text-emerald-300">Precisa de artistas</span> : <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-400">Sem vagas para artistas</span>}
+                </div>
+                {item.description && <p className="text-sm text-zinc-300 mt-3 whitespace-pre-wrap">{item.description}</p>}
+                {isOrganizer && normalizeId(editingEventId) === normalizeId(item.id) && (
+                  <form onSubmit={(event) => handleSaveEventEdit(event, item.id)} className="mt-3 rounded-xl border border-zinc-800 bg-zinc-950 p-3 space-y-2">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      <input type="text" required value={eventEditDraft.title} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, title: event.target.value }))} placeholder="Titulo do evento" className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                      <input type="datetime-local" required value={eventEditDraft.event_date} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, event_date: event.target.value }))} className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                      <input type="text" required value={eventEditDraft.venue} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, venue: event.target.value }))} placeholder="Local" className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                      <input type="text" required value={eventEditDraft.city} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, city: event.target.value }))} placeholder="Cidade / Estado" className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                      <input type="text" value={eventEditDraft.genre} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, genre: event.target.value }))} placeholder="Genero" className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                      <input type="text" value={eventEditDraft.ticket_url} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, ticket_url: event.target.value }))} placeholder="Link de ingressos" className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                    </div>
+                    <input type="text" value={eventEditDraft.contact_url} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, contact_url: event.target.value }))} placeholder="Link de contato" className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                    <input type="text" value={eventEditDraft.cover_url} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, cover_url: event.target.value }))} placeholder="URL da capa" className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500" />
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      <label className="text-[11px] text-zinc-400">
+                        Posicao horizontal ({clampPercent(eventEditDraft.cover_position_x, 50)}%)
+                        <input type="range" min="0" max="100" value={clampPercent(eventEditDraft.cover_position_x, 50)} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, cover_position_x: Number(event.target.value) }))} className="w-full mt-1" />
+                      </label>
+                      <label className="text-[11px] text-zinc-400">
+                        Posicao vertical ({clampPercent(eventEditDraft.cover_position_y, 50)}%)
+                        <input type="range" min="0" max="100" value={clampPercent(eventEditDraft.cover_position_y, 50)} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, cover_position_y: Number(event.target.value) }))} className="w-full mt-1" />
+                      </label>
+                    </div>
+                    <label className="inline-flex items-center gap-2 text-xs text-zinc-300">
+                      <input type="checkbox" checked={eventEditDraft.needs_artists} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, needs_artists: event.target.checked }))} className="rounded border-zinc-700 bg-zinc-900 text-violet-500 focus:ring-violet-500/50" />
+                      Precisa de artistas
+                    </label>
+                    {eventEditDraft.needs_artists && (
+                      <textarea value={eventEditDraft.artist_requirements} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, artist_requirements: event.target.value }))} rows={2} placeholder="Requisitos para artistas" className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500 resize-none" />
+                    )}
+                    <textarea value={eventEditDraft.description} onChange={(event) => setEventEditDraft((prev) => ({ ...prev, description: event.target.value }))} rows={3} placeholder="Descricao do evento" className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-violet-500 resize-none" />
+                    <div className="flex flex-wrap gap-2">
+                      <button type="submit" disabled={eventEditSaving} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white disabled:opacity-60">
+                        {eventEditSaving ? 'Salvando...' : 'Salvar edicao'}
+                      </button>
+                      <button type="button" onClick={handleCancelEditEvent} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">
+                        Cancelar
+                      </button>
+                    </div>
+                  </form>
+                )}
+                {item.needs_artists && item.artist_requirements && (
+                  <div className="mt-3 bg-zinc-950 border border-zinc-800 rounded-xl p-3">
+                    <p className="text-xs text-emerald-300 font-semibold mb-1">Requisitos para artistas</p>
+                    <p className="text-sm text-zinc-300 whitespace-pre-wrap">{item.artist_requirements}</p>
+                  </div>
+                )}
+
+                <div className="mt-4 bg-zinc-950 border border-zinc-800 rounded-xl p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="text-xs text-zinc-300 font-semibold">Lista de interessados ({interestedUsers.length})</p>
+                      <p className="text-[11px] text-zinc-500">Confirme presenca no evento com o botao Vou.</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleToggleRsvp({
+                        eventId: item.id,
+                        hasRsvp,
+                        organizerId: item.organizer_id,
+                        eventTitle: item.title
+                      })}
+                      disabled={rsvpLoadingEventId === item.id}
+                      className={`text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors ${
+                        hasRsvp
+                          ? 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
+                          : 'bg-violet-600 text-white hover:bg-violet-700'
+                      } disabled:opacity-60`}
+                    >
+                      {rsvpLoadingEventId === item.id ? 'Salvando...' : hasRsvp ? 'Nao vou mais' : 'Vou'}
+                    </button>
+                  </div>
+                  {interestedUsers.length > 0 ? (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {interestedUsers.slice(0, 12).map((entry) => {
+                        const attendeeProfile = Array.isArray(entry.profiles) ? entry.profiles[0] : entry.profiles;
+                        return (
+                          <button
+                            key={entry.id}
+                            type="button"
+                            onClick={() => attendeeProfile?.id && onOpenProfile?.(attendeeProfile)}
+                            className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-violet-500/40 text-xs text-zinc-200"
+                          >
+                            {attendeeProfile?.avatar_url ? (
+                              <img src={attendeeProfile.avatar_url} className="w-5 h-5 rounded-full object-cover bg-zinc-800" />
+                            ) : (
+                              <span className="w-5 h-5 rounded-full bg-zinc-800 inline-flex items-center justify-center text-[10px] text-zinc-400">
+                                {(attendeeProfile?.name || 'U').slice(0, 1).toUpperCase()}
+                              </span>
+                            )}
+                            <span>{attendeeProfile?.name || attendeeProfile?.handle || 'Usuario'}</span>
+                          </button>
+                        );
+                      })}
+                      {interestedUsers.length > 12 && (
+                        <span className="inline-flex items-center px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-zinc-400">
+                          +{interestedUsers.length - 12} pessoas
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-zinc-500 mt-3">Ninguem confirmou presenca ainda.</p>
+                  )}
+                </div>
+
+                {item.needs_artists && (
+                  <div className="mt-4 bg-zinc-950 border border-zinc-800 rounded-xl p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <p className="text-xs text-zinc-300 font-semibold">Candidaturas de artistas ({artistsApplications.length})</p>
+                        <p className="text-[11px] text-zinc-500">{isOrganizer ? 'Gerencie as candidaturas recebidas.' : 'Envie sua candidatura para tocar neste evento.'}</p>
+                      </div>
+                    </div>
+
+                    {isOrganizer ? (
+                      artistsApplications.length > 0 ? (
+                        <div className="mt-3 space-y-2">
+                          {artistsApplications.map((application) => {
+                            const artistProfile = Array.isArray(application.profiles) ? application.profiles[0] : application.profiles;
+                            const statusUi = getApplicationStatusUi(application.status);
+                            return (
+                              <div key={application.id} className="rounded-lg border border-zinc-800 bg-zinc-900 p-3">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => artistProfile?.id && onOpenProfile?.(artistProfile)}
+                                    className="text-sm text-zinc-200 hover:text-violet-300"
+                                  >
+                                    {artistProfile?.name || artistProfile?.handle || 'Artista'}
+                                  </button>
+                                  <span className={`text-[11px] px-2 py-1 rounded-md ${statusUi.className}`}>{statusUi.label}</span>
+                                </div>
+                                {application.message && <p className="text-sm text-zinc-300 mt-2 whitespace-pre-wrap">{application.message}</p>}
+                                {application.portfolio_url && (
+                                  <a href={application.portfolio_url} target="_blank" rel="noreferrer" className="inline-flex mt-2 text-xs text-violet-300 hover:text-violet-200">
+                                    Portfolio / Midia
+                                  </a>
+                                )}
+                                <div className="mt-3 flex flex-wrap gap-2">
+                                  {application.status !== 'accepted' && (
+                                    <button
+                                      type="button"
+                                      disabled={applicationReviewId === application.id}
+                                      onClick={() => handleReviewArtistApplication({
+                                        applicationId: application.id,
+                                        nextStatus: 'accepted',
+                                        artistId: application.artist_id,
+                                        eventId: item.id,
+                                        eventTitle: item.title
+                                      })}
+                                      className="text-xs px-2.5 py-1.5 rounded-lg bg-emerald-600/90 text-white hover:bg-emerald-600 disabled:opacity-60"
+                                    >
+                                      Aceitar
+                                    </button>
+                                  )}
+                                  {application.status !== 'rejected' && (
+                                    <button
+                                      type="button"
+                                      disabled={applicationReviewId === application.id}
+                                      onClick={() => handleReviewArtistApplication({
+                                        applicationId: application.id,
+                                        nextStatus: 'rejected',
+                                        artistId: application.artist_id,
+                                        eventId: item.id,
+                                        eventTitle: item.title
+                                      })}
+                                      className="text-xs px-2.5 py-1.5 rounded-lg bg-red-600/90 text-white hover:bg-red-600 disabled:opacity-60"
+                                    >
+                                      Recusar
+                                    </button>
+                                  )}
+                                  {application.status !== 'pending' && (
+                                    <button
+                                      type="button"
+                                      disabled={applicationReviewId === application.id}
+                                      onClick={() => handleReviewArtistApplication({
+                                        applicationId: application.id,
+                                        nextStatus: 'pending',
+                                        artistId: application.artist_id,
+                                        eventId: item.id,
+                                        eventTitle: item.title
+                                      })}
+                                      className="text-xs px-2.5 py-1.5 rounded-lg bg-zinc-800 text-zinc-200 hover:bg-zinc-700 disabled:opacity-60"
+                                    >
+                                      Voltar para pendente
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-zinc-500 mt-3">Nenhuma candidatura recebida ainda.</p>
+                      )
+                    ) : (
+                      myApplication ? (
+                        <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900 p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <p className="text-sm text-zinc-300">Sua candidatura foi enviada.</p>
+                            <span className={`text-[11px] px-2 py-1 rounded-md ${getApplicationStatusUi(myApplication.status).className}`}>
+                              {getApplicationStatusUi(myApplication.status).label}
+                            </span>
+                          </div>
+                          {myApplication.message && <p className="text-sm text-zinc-400 mt-2 whitespace-pre-wrap">{myApplication.message}</p>}
+                          {myApplication.portfolio_url && (
+                            <a href={myApplication.portfolio_url} target="_blank" rel="noreferrer" className="inline-flex mt-2 text-xs text-violet-300 hover:text-violet-200">
+                              Ver portfolio enviado
+                            </a>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleWithdrawArtistApplication(myApplication.id)}
+                            className="mt-3 text-xs px-2.5 py-1.5 rounded-lg bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+                          >
+                            {myApplication.status === 'pending' ? 'Retirar candidatura' : 'Remover candidatura'}
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="mt-3 space-y-2">
+                          <textarea
+                            value={draft.message}
+                            onChange={(event) => updateApplicationDraft(item.id, 'message', event.target.value)}
+                            rows={3}
+                            placeholder="Apresente sua proposta para tocar no evento..."
+                            className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2 text-sm text-white outline-none focus:border-violet-500 resize-none"
+                          />
+                          <input
+                            type="text"
+                            value={draft.portfolio_url}
+                            onChange={(event) => updateApplicationDraft(item.id, 'portfolio_url', event.target.value)}
+                            placeholder="Link de portfolio, video ou rede social (opcional)"
+                            className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2 text-sm text-white outline-none focus:border-violet-500"
+                          />
+                          <button
+                            type="button"
+                            disabled={applicationLoadingEventId === item.id}
+                            onClick={() => handleSubmitArtistApplication({
+                              eventId: item.id,
+                              organizerId: item.organizer_id,
+                              eventTitle: item.title
+                            })}
+                            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700 disabled:opacity-60"
+                          >
+                            {applicationLoadingEventId === item.id ? 'Enviando...' : 'Enviar candidatura'}
+                          </button>
+                        </div>
+                      )
+                    )}
+                  </div>
+                )}
+
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
+                  <button type="button" onClick={() => item.profiles?.id && onOpenProfile?.(item.profiles)} className="text-xs text-zinc-400 hover:text-violet-300 transition-colors">
+                    Organizador: {item.profiles?.name || 'Usuario'} {item.profiles?.handle || ''}
+                  </button>
+                  <div className="flex flex-wrap gap-2">
+                    {(item.venue || item.city) && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => openMapModal(item.title || 'Local do evento', `${item.venue || ''}, ${item.city || ''}`)}
+                          className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100"
+                        >
+                          Maps
+                        </button>
+                        <a href={buildGoogleMapsSearchUrl(`${item.venue || ''}, ${item.city || ''}`)} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-zinc-200">
+                          Abrir
+                        </a>
+                      </>
+                    )}
+                    {item.ticket_url && <a href={item.ticket_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm font-semibold px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white"><Ticket className="w-4 h-4" />Ingressos</a>}
+                    {item.contact_url && <a href={item.contact_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">Contato</a>}
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
       <MapsModal
         isOpen={mapModal.open}
@@ -3649,7 +4547,416 @@ function EventsView({ currentUser, onOpenProfile }) {
   );
 }
 
-function NotificationsView({ currentUser, onOpenProfile, onNavigate }) {
+function DiscoverView({ currentUser, onOpenProfile, onNavigate }) {
+  const PAGE_SIZE = 12;
+  const ENTITY_LIMIT = 120;
+  const [searchText, setSearchText] = useState('');
+  const [scope, setScope] = useState('all');
+  const [loading, setLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [results, setResults] = useState([]);
+  const [counts, setCounts] = useState({
+    profiles: 0,
+    communities: 0,
+    events: 0,
+    shopping: 0,
+    playlists: 0
+  });
+  const [page, setPage] = useState(1);
+
+  useEffect(() => {
+    setPage(1);
+  }, [searchText, scope]);
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    const runSearch = async () => {
+      const trimmedQuery = String(searchText || '').trim();
+      const minLengthReached = trimmedQuery.length >= 2;
+      if (!minLengthReached) {
+        if (!isCancelled) {
+          setLoading(false);
+          setErrorMessage('');
+          setResults([]);
+          setCounts({
+            profiles: 0,
+            communities: 0,
+            events: 0,
+            shopping: 0,
+            playlists: 0
+          });
+        }
+        return;
+      }
+
+      setLoading(true);
+      setErrorMessage('');
+
+      const blockedUsers = await buildBlockedUserIdSet(currentUser.id);
+      const cleanedTerm = trimmedQuery
+        .replace(/[,%_()]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 80);
+      const pattern = `%${cleanedTerm || trimmedQuery}%`;
+      const shouldLoadAll = scope === 'all';
+
+      const [
+        profilesResult,
+        communitiesResult,
+        eventsResult,
+        listingsResult,
+        playlistsResult
+      ] = await Promise.all([
+        shouldLoadAll || scope === 'profiles'
+          ? supabase
+              .from('profiles')
+              .select('id, name, handle, bio, avatar_url, created_at')
+              .or(`name.ilike.${pattern},handle.ilike.${pattern},bio.ilike.${pattern}`)
+              .order('created_at', { ascending: false })
+              .limit(ENTITY_LIMIT)
+          : Promise.resolve({ data: [], error: null }),
+        shouldLoadAll || scope === 'communities'
+          ? supabase
+              .from('communities')
+              .select('id, name, description, genre, created_by, created_at')
+              .or(`name.ilike.${pattern},description.ilike.${pattern},genre.ilike.${pattern}`)
+              .order('created_at', { ascending: false })
+              .limit(ENTITY_LIMIT)
+          : Promise.resolve({ data: [], error: null }),
+        shouldLoadAll || scope === 'events'
+          ? supabase
+              .from('music_events')
+              .select('id, title, description, venue, city, genre, event_date, organizer_id, created_at')
+              .or(`title.ilike.${pattern},description.ilike.${pattern},venue.ilike.${pattern},city.ilike.${pattern},genre.ilike.${pattern}`)
+              .order('created_at', { ascending: false })
+              .limit(ENTITY_LIMIT)
+          : Promise.resolve({ data: [], error: null }),
+        shouldLoadAll || scope === 'shopping'
+          ? supabase
+              .from('marketplace_listings')
+              .select('id, title, description, category, location, price, status, seller_id, created_at, is_active')
+              .or(`title.ilike.${pattern},description.ilike.${pattern},category.ilike.${pattern},location.ilike.${pattern}`)
+              .order('created_at', { ascending: false })
+              .limit(ENTITY_LIMIT)
+          : Promise.resolve({ data: [], error: null }),
+        shouldLoadAll || scope === 'playlists'
+          ? supabase
+              .from('playlists')
+              .select('id, name, description, spotify_url, user_id, created_at')
+              .or(`name.ilike.${pattern},description.ilike.${pattern},spotify_url.ilike.${pattern}`)
+              .order('created_at', { ascending: false })
+              .limit(ENTITY_LIMIT)
+          : Promise.resolve({ data: [], error: null })
+      ]);
+
+      const hadError = [profilesResult, communitiesResult, eventsResult, listingsResult, playlistsResult].some((result) => result?.error);
+      if (hadError && !isCancelled) {
+        setErrorMessage('Alguns resultados podem estar incompletos. Verifique tabelas e policies de busca.');
+      }
+
+      const communitiesData = Array.isArray(communitiesResult.data) ? communitiesResult.data : [];
+      const eventsData = Array.isArray(eventsResult.data) ? eventsResult.data : [];
+      const listingsData = Array.isArray(listingsResult.data) ? listingsResult.data : [];
+      const playlistsData = Array.isArray(playlistsResult.data) ? playlistsResult.data : [];
+
+      const ownerIds = Array.from(new Set([
+        ...communitiesData.map((row) => normalizeId(row.created_by)),
+        ...eventsData.map((row) => normalizeId(row.organizer_id)),
+        ...listingsData.map((row) => normalizeId(row.seller_id)),
+        ...playlistsData.map((row) => normalizeId(row.user_id))
+      ].filter(Boolean)));
+
+      let ownersById = {};
+      if (ownerIds.length) {
+        const { data: ownersData } = await supabase
+          .from('profiles')
+          .select('id, name, handle, avatar_url')
+          .in('id', ownerIds);
+
+        ownersById = (ownersData || []).reduce((acc, profile) => {
+          acc[normalizeId(profile.id)] = profile;
+          return acc;
+        }, {});
+      }
+
+      const profileResults = (profilesResult.data || [])
+        .filter((profile) => !blockedUsers.has(normalizeId(profile.id)))
+        .map((profile) => ({
+          key: `profile-${profile.id}`,
+          type: 'profiles',
+          id: profile.id,
+          title: profile.name || profile.handle || 'Usuario',
+          subtitle: [profile.handle, profile.bio].filter(Boolean).join(' • '),
+          created_at: profile.created_at,
+          profile,
+          ownerProfile: profile
+        }));
+
+      const communityResults = communitiesData
+        .filter((community) => !blockedUsers.has(normalizeId(community.created_by)))
+        .map((community) => ({
+          key: `community-${community.id}`,
+          type: 'communities',
+          id: community.id,
+          title: community.name || 'Comunidade',
+          subtitle: [community.genre, community.description].filter(Boolean).join(' • '),
+          created_at: community.created_at,
+          data: community,
+          ownerProfile: ownersById[normalizeId(community.created_by)] || null
+        }));
+
+      const eventResults = eventsData
+        .filter((eventItem) => !blockedUsers.has(normalizeId(eventItem.organizer_id)))
+        .map((eventItem) => ({
+          key: `event-${eventItem.id}`,
+          type: 'events',
+          id: eventItem.id,
+          title: eventItem.title || 'Evento',
+          subtitle: [eventItem.venue, eventItem.city, eventItem.genre].filter(Boolean).join(' • '),
+          created_at: eventItem.created_at || eventItem.event_date,
+          data: eventItem,
+          ownerProfile: ownersById[normalizeId(eventItem.organizer_id)] || null
+        }));
+
+      const shoppingResults = listingsData
+        .filter((listing) => listing.is_active !== false && !blockedUsers.has(normalizeId(listing.seller_id)))
+        .map((listing) => ({
+          key: `shopping-${listing.id}`,
+          type: 'shopping',
+          id: listing.id,
+          title: listing.title || 'Anuncio',
+          subtitle: [listing.category, listing.location, listing.status === 'sold' ? 'Vendido' : 'Disponivel'].filter(Boolean).join(' • '),
+          created_at: listing.created_at,
+          data: listing,
+          ownerProfile: ownersById[normalizeId(listing.seller_id)] || null
+        }));
+
+      const playlistResults = playlistsData
+        .filter((playlist) => !blockedUsers.has(normalizeId(playlist.user_id)))
+        .map((playlist) => ({
+          key: `playlist-${playlist.id}`,
+          type: 'playlists',
+          id: playlist.id,
+          title: playlist.name || 'Playlist',
+          subtitle: playlist.description || playlist.spotify_url || '',
+          created_at: playlist.created_at,
+          data: playlist,
+          ownerProfile: ownersById[normalizeId(playlist.user_id)] || null
+        }));
+
+      const mergedResults = [
+        ...profileResults,
+        ...communityResults,
+        ...eventResults,
+        ...shoppingResults,
+        ...playlistResults
+      ].sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+
+      if (isCancelled) return;
+
+      setCounts({
+        profiles: profileResults.length,
+        communities: communityResults.length,
+        events: eventResults.length,
+        shopping: shoppingResults.length,
+        playlists: playlistResults.length
+      });
+      setResults(mergedResults);
+      setLoading(false);
+    };
+
+    const timeout = setTimeout(runSearch, 280);
+    return () => {
+      isCancelled = true;
+      clearTimeout(timeout);
+    };
+  }, [searchText, scope, currentUser.id]);
+
+  const totalPages = Math.max(1, Math.ceil(results.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const paginatedResults = results.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+  const formatBRL = (value) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(Number(value || 0));
+  const scopeOptions = [
+    { id: 'all', label: 'Tudo' },
+    { id: 'profiles', label: 'Usuarios' },
+    { id: 'communities', label: 'Comunidades' },
+    { id: 'events', label: 'Eventos' },
+    { id: 'shopping', label: 'Anuncios' },
+    { id: 'playlists', label: 'Playlists' }
+  ];
+  const iconByType = {
+    profiles: User,
+    communities: Users,
+    events: CalendarDays,
+    shopping: ShoppingBag,
+    playlists: ListMusic
+  };
+  const totalHits = counts.profiles + counts.communities + counts.events + counts.shopping + counts.playlists;
+  const queryReady = String(searchText || '').trim().length >= 2;
+
+  const handleResultAction = (item) => {
+    if (item.type === 'profiles') {
+      onOpenProfile?.(item.profile || item.ownerProfile || item.id);
+      return;
+    }
+    if (item.type === 'communities') {
+      onNavigate?.('communities');
+      return;
+    }
+    if (item.type === 'events') {
+      onNavigate?.('events');
+      return;
+    }
+    if (item.type === 'shopping') {
+      onNavigate?.('shopping');
+      return;
+    }
+    if (item.type === 'playlists') {
+      onNavigate?.('playlists');
+    }
+  };
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+
+  return (
+    <div className="p-4 md:p-8">
+      <div className="mb-6">
+        <h2 className="text-2xl font-bold text-white flex items-center gap-2"><Search className="w-6 h-6 text-violet-400" /> Busca e descoberta</h2>
+        <p className="text-zinc-400 text-sm">Busque usuarios, comunidades, eventos, anuncios e playlists em um unico lugar.</p>
+      </div>
+
+      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-4 space-y-3">
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+          <input
+            type="text"
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            placeholder="Digite ao menos 2 caracteres..."
+            className="w-full bg-zinc-950 border border-zinc-800 rounded-xl pl-9 pr-3 py-2 text-sm text-white focus:border-violet-500 outline-none"
+          />
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {scopeOptions.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setScope(item.id)}
+              className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${
+                scope === item.id
+                  ? 'border-violet-500/40 bg-violet-500/10 text-violet-200'
+                  : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+        {queryReady && (
+          <div className="text-xs text-zinc-500 flex flex-wrap gap-x-4 gap-y-1">
+            <span>Usuarios: {counts.profiles}</span>
+            <span>Comunidades: {counts.communities}</span>
+            <span>Eventos: {counts.events}</span>
+            <span>Anuncios: {counts.shopping}</span>
+            <span>Playlists: {counts.playlists}</span>
+            <span>Total: {totalHits}</span>
+          </div>
+        )}
+      </div>
+
+      {errorMessage && <div className="mb-4 bg-red-500/10 border border-red-500/30 text-red-300 rounded-xl px-4 py-3 text-sm">{errorMessage}</div>}
+      {!queryReady && <p className="text-sm text-zinc-500">Digite pelo menos 2 caracteres para iniciar a busca global.</p>}
+      {loading && <p className="text-sm text-zinc-500">Buscando...</p>}
+      {!loading && queryReady && paginatedResults.length === 0 && <p className="text-sm text-zinc-500">Nenhum resultado encontrado.</p>}
+
+      <div className="space-y-3">
+        {!loading && paginatedResults.map((item) => {
+          const TypeIcon = iconByType[item.type] || Search;
+          const owner = item.ownerProfile;
+          const createdLabel = item.created_at
+            ? new Date(item.created_at).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' })
+            : '';
+          const typeLabel = item.type === 'profiles'
+            ? 'Usuario'
+            : item.type === 'communities'
+              ? 'Comunidade'
+              : item.type === 'events'
+                ? 'Evento'
+                : item.type === 'shopping'
+                  ? 'Anuncio'
+                  : 'Playlist';
+
+          return (
+            <div key={item.key} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[11px] text-zinc-500 inline-flex items-center gap-1">
+                    <TypeIcon className="w-3.5 h-3.5" />
+                    {typeLabel}
+                    {createdLabel ? ` • ${createdLabel}` : ''}
+                  </p>
+                  <h3 className="text-base font-semibold text-white mt-1 break-words">{item.title}</h3>
+                  {item.subtitle && <p className="text-sm text-zinc-400 mt-1 break-words">{item.subtitle}</p>}
+                  {item.type === 'shopping' && (
+                    <p className="text-sm font-semibold text-violet-300 mt-1">{formatBRL(item.data?.price)}</p>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleResultAction(item)}
+                  className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700"
+                >
+                  Abrir
+                </button>
+              </div>
+              {owner?.id && item.type !== 'profiles' && (
+                <button
+                  type="button"
+                  onClick={() => onOpenProfile?.(owner)}
+                  className="mt-3 text-xs text-zinc-400 hover:text-violet-300 transition-colors"
+                >
+                  Por: {owner.name || 'Usuario'} {owner.handle || ''}
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {!loading && queryReady && results.length > 0 && (
+        <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs text-zinc-500">
+            Pagina {currentPage} de {totalPages} • {results.length} resultados
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+              disabled={currentPage <= 1}
+              className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+            >
+              Anterior
+            </button>
+            <button
+              type="button"
+              onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+              disabled={currentPage >= totalPages}
+              className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+            >
+              Proxima
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NotificationsView({ currentUser, onOpenProfile, onNavigate, onUnreadCountChange }) {
   const [notifications, setNotifications] = useState([]);
   const [loading, setLoading] = useState(true);
   const [markingAll, setMarkingAll] = useState(false);
@@ -3696,6 +5003,10 @@ function NotificationsView({ currentUser, onOpenProfile, onNavigate }) {
   };
 
   const unreadCount = notifications.filter((item) => !item.is_read).length;
+
+  useEffect(() => {
+    onUnreadCountChange?.(unreadCount);
+  }, [unreadCount, onUnreadCountChange]);
 
   const markRead = async (notificationId) => {
     const id = Number(notificationId);
@@ -5575,10 +6886,17 @@ function MapsModal({ isOpen, title, query, onClose }) {
   );
 }
 
-function NavItem({ icon, label, active, onClick }) {
+function NavItem({ icon, label, active, onClick, badgeCount = 0 }) {
   return (
     <button onClick={onClick} className={`w-full flex items-center justify-center md:justify-start px-3 py-3 rounded-xl transition-all ${active ? 'bg-violet-600/10 text-violet-400 font-bold' : 'text-zinc-400 hover:bg-zinc-800 hover:text-white font-medium'}`}>
-      <div className={active ? "text-violet-500" : ""}>{React.cloneElement(icon, { className: 'w-6 h-6' })}</div>
+      <div className={`relative ${active ? 'text-violet-500' : ''}`}>
+        {React.cloneElement(icon, { className: 'w-6 h-6' })}
+        {badgeCount > 0 && (
+          <span className="absolute -top-1.5 -right-2 min-w-[1.05rem] h-[1.05rem] px-1 rounded-full bg-rose-500 text-white text-[10px] font-bold leading-none flex items-center justify-center">
+            {formatNotificationBadge(badgeCount)}
+          </span>
+        )}
+      </div>
       <span className="hidden md:block ml-4">{label}</span>
     </button>
   );
@@ -5605,7 +6923,14 @@ function MobileBottomNav({ items, activeTab, onSelect }) {
                 }`}
                 title={item.label}
               >
-                <Icon className={`w-5 h-5 ${isActive ? 'text-violet-400' : ''}`} />
+                <div className="relative">
+                  <Icon className={`w-5 h-5 ${isActive ? 'text-violet-400' : ''}`} />
+                  {item.badgeCount > 0 && (
+                    <span className="absolute -top-2 -right-2 min-w-[1.05rem] h-[1.05rem] px-1 rounded-full bg-rose-500 text-white text-[10px] font-bold leading-none flex items-center justify-center">
+                      {formatNotificationBadge(item.badgeCount)}
+                    </span>
+                  )}
+                </div>
               </button>
             );
           })}

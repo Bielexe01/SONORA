@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.3/+esm';
 import './CommunitiesHub.css';
+import { sendWebPushNotifications } from './pushClient.js';
 
 const supabaseUrl = 'https://vasihzrqjggfbxdmvujc.supabase.co';
 const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZhc2loenJxamdnZmJ4ZG12dWpjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNDc5NzIsImV4cCI6MjA4ODcyMzk3Mn0.AYrc6tK94iP2lK78nHrSjdenZvXYw-g1_cC7aisgXyA';
@@ -18,6 +19,8 @@ const COMMUNITY_POSTS_STORAGE_KEY = 'sonora_community_posts';
 const COMMUNITY_MEDIA_STORAGE_KEY = 'sonora_community_media';
 const COMMUNITY_REACTIONS_STORAGE_KEY = 'sonora_community_post_reactions';
 const COMMUNITY_JOIN_REQUESTS_STORAGE_KEY = 'sonora_community_join_requests';
+const COMMUNITY_ROLE_ORDER = { owner: 0, admin: 1, mod: 2, member: 3 };
+const COMMUNITY_ROLE_LABELS = { owner: 'Owner', admin: 'Admin', mod: 'Mod', member: 'Membro' };
 const COMMUNITY_DEFAULT_GENRES = ['Rock', 'Pop', 'Rap', 'Eletrônica', 'Gospel', 'MPB', 'Indie', 'Jazz'];
 const SPOTIFY_TYPES = new Set(['track', 'album', 'playlist', 'artist', 'episode', 'show']);
 const REACTION_FIELD_TO_KEY = {
@@ -55,6 +58,16 @@ const TAB_CONTENT_PLACEHOLDER = {
   colaboracao: 'Explique a colaboracao e como participar',
   desafios: 'Explique as regras do desafio',
   midia: 'Descreva a faixa, album ou midia'
+};
+
+const normalizeCommunityRole = (value) => {
+  const role = String(value || 'member').toLowerCase();
+  return COMMUNITY_ROLE_ORDER[role] !== undefined ? role : 'member';
+};
+
+const normalizeCommunityStatus = (value) => {
+  const status = String(value || 'approved').toLowerCase();
+  return ['pending', 'approved', 'rejected'].includes(status) ? status : 'approved';
 };
 
 const parseSpotifyLink = (rawUrl) => {
@@ -191,7 +204,7 @@ const createCommunityInviteNotification = async ({ recipientId, actorId, communi
   const actor = String(actorId || '');
   if (!recipient || !actor || recipient === actor) return;
 
-  await supabase.from('notifications').insert([{
+  const { data, error } = await supabase.from('notifications').insert([{
     recipient_id: recipient,
     actor_id: actor,
     type: 'community_invite',
@@ -199,8 +212,61 @@ const createCommunityInviteNotification = async ({ recipientId, actorId, communi
     body: 'Sua solicitacao foi aprovada. Toque para entrar na comunidade.',
     entity_type: 'community',
     entity_id: String(communityId || ''),
-    metadata: { community_id: String(communityId || '') }
-  }]);
+    metadata: {
+      community_id: String(communityId || ''),
+      action: 'approval'
+    }
+  }]).select('id');
+
+  if (error) return;
+  const notificationIds = (data || [])
+    .map((item) => item?.id)
+    .filter((id) => id !== null && id !== undefined);
+  if (notificationIds.length) {
+    await sendWebPushNotifications({ supabase, notificationIds });
+  }
+};
+
+const createCommunityJoinRequestNotifications = async ({
+  recipientIds,
+  actorId,
+  communityId,
+  communityName,
+  requesterHandle,
+  requesterName
+}) => {
+  const actor = String(actorId || '');
+  if (!actor || !Array.isArray(recipientIds) || !recipientIds.length) return;
+
+  const uniqueRecipients = [...new Set(recipientIds
+    .map((id) => String(id || '').trim())
+    .filter((id) => id && id !== actor))];
+
+  if (!uniqueRecipients.length) return;
+
+  const requesterLabel = requesterHandle || requesterName || 'Um usuario';
+
+  const { data, error } = await supabase.from('notifications').insert(uniqueRecipients.map((recipient) => ({
+    recipient_id: recipient,
+    actor_id: actor,
+    type: 'community_invite',
+    title: `Novo pedido em ${communityName || 'Comunidade'}`,
+    body: `${requesterLabel} pediu para entrar na comunidade.`,
+    entity_type: 'community',
+    entity_id: String(communityId || ''),
+    metadata: {
+      community_id: String(communityId || ''),
+      action: 'join_request'
+    }
+  }))).select('id');
+
+  if (error) return;
+  const notificationIds = (data || [])
+    .map((item) => item?.id)
+    .filter((id) => id !== null && id !== undefined);
+  if (notificationIds.length) {
+    await sendWebPushNotifications({ supabase, notificationIds });
+  }
 };
 
 const normalizeCommunityPost = (post) => {
@@ -252,6 +318,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
   const [newCommunity, setNewCommunity] = useState({
     name: '',
     description: '',
+    rules: '',
     genre: COMMUNITY_DEFAULT_GENRES[0],
     is_public: true
   });
@@ -264,10 +331,21 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
   const [membershipBackend, setMembershipBackend] = useState('checking');
   const [joinedCommunityIds, setJoinedCommunityIds] = useState([]);
   const [pendingRequestsByCommunity, setPendingRequestsByCommunity] = useState({});
+  const [communityMembershipsByCommunity, setCommunityMembershipsByCommunity] = useState({});
   const [memberCountMap, setMemberCountMap] = useState({});
   const [memberIdsByCommunity, setMemberIdsByCommunity] = useState({});
   const [joiningId, setJoiningId] = useState(null);
+  const [updatingMemberRoleId, setUpdatingMemberRoleId] = useState('');
   const [deletingId, setDeletingId] = useState(null);
+  const [editingCommunity, setEditingCommunity] = useState(false);
+  const [savingCommunity, setSavingCommunity] = useState(false);
+  const [communityDraft, setCommunityDraft] = useState({
+    name: '',
+    description: '',
+    rules: '',
+    genre: COMMUNITY_DEFAULT_GENRES[0],
+    is_public: true
+  });
 
   const [profilesById, setProfilesById] = useState({});
 
@@ -361,24 +439,30 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     const communityIds = baseCommunities.map((community) => community.id);
     if (!communityIds.length) {
       setJoinedCommunityIds([]);
+      setPendingRequestsByCommunity({});
+      setCommunityMembershipsByCommunity({});
       setMemberCountMap({});
       setMemberIdsByCommunity({});
       return;
     }
 
+    const membershipsByCommunity = {};
+    const joinedSet = new Set();
+
     const { data, error } = await supabase
       .from('community_members')
-      .select('community_id, user_id')
+      .select('community_id, user_id, role, status, created_at, updated_at, approved_at, approved_by')
       .in('community_id', communityIds);
-
-    const membersByCommunity = {};
-    const joinedSet = new Set();
 
     if (!error) {
       (data || []).forEach((membership) => {
-        if (!membersByCommunity[membership.community_id]) membersByCommunity[membership.community_id] = [];
-        membersByCommunity[membership.community_id].push(membership.user_id);
-        if (membership.user_id === currentUser.id) joinedSet.add(membership.community_id);
+        if (!membership?.community_id || !membership?.user_id) return;
+        if (!membershipsByCommunity[membership.community_id]) membershipsByCommunity[membership.community_id] = [];
+        membershipsByCommunity[membership.community_id].push({
+          ...membership,
+          role: normalizeCommunityRole(membership.role),
+          status: normalizeCommunityStatus(membership.status)
+        });
       });
       setMembershipBackend('remote');
     } else {
@@ -386,32 +470,97 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
       Object.entries(localMembership.allMemberships).forEach(([userId, ids]) => {
         if (!Array.isArray(ids)) return;
         ids.forEach((communityId) => {
-          if (!membersByCommunity[communityId]) membersByCommunity[communityId] = [];
-          membersByCommunity[communityId].push(userId);
-          if (userId === currentUser.id) joinedSet.add(communityId);
+          if (!membershipsByCommunity[communityId]) membershipsByCommunity[communityId] = [];
+          membershipsByCommunity[communityId].push({
+            community_id: communityId,
+            user_id: userId,
+            role: 'member',
+            status: 'approved',
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          });
+        });
+      });
+      const localRequests = getLocalCommunityJoinRequestsState();
+      Object.entries(localRequests).forEach(([communityId, userIds]) => {
+        if (!Array.isArray(userIds)) return;
+        userIds.forEach((userId) => {
+          if (!membershipsByCommunity[communityId]) membershipsByCommunity[communityId] = [];
+          membershipsByCommunity[communityId].push({
+            community_id: communityId,
+            user_id: userId,
+            role: 'member',
+            status: 'pending',
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          });
         });
       });
       setMembershipBackend('local');
     }
 
-    baseCommunities.forEach((community) => {
-      const set = new Set(membersByCommunity[community.id] || []);
-      if (community.created_by) set.add(community.created_by);
-      if (community.created_by === currentUser.id) joinedSet.add(community.id);
-      membersByCommunity[community.id] = Array.from(set);
-    });
-
+    const statusWeight = { approved: 3, pending: 2, rejected: 1 };
+    const normalizedMemberships = {};
+    const approvedMembersByCommunity = {};
+    const pendingByCommunity = {};
     const countMap = {};
-    const allMemberIds = [];
-    Object.entries(membersByCommunity).forEach(([communityId, ids]) => {
-      countMap[communityId] = ids.length;
-      allMemberIds.push(...ids);
+    const allMemberIds = new Set();
+
+    baseCommunities.forEach((community) => {
+      const rows = Array.isArray(membershipsByCommunity[community.id]) ? membershipsByCommunity[community.id] : [];
+      const dedupByUser = new Map();
+
+      rows.forEach((membership) => {
+        const userId = membership?.user_id;
+        if (!userId) return;
+        const normalized = {
+          ...membership,
+          community_id: community.id,
+          user_id: userId,
+          role: normalizeCommunityRole(membership.role),
+          status: normalizeCommunityStatus(membership.status)
+        };
+        const current = dedupByUser.get(userId);
+        if (!current || (statusWeight[normalized.status] || 0) >= (statusWeight[current.status] || 0)) {
+          dedupByUser.set(userId, normalized);
+        }
+      });
+
+      if (community.created_by) {
+        dedupByUser.set(community.created_by, {
+          community_id: community.id,
+          user_id: community.created_by,
+          role: 'owner',
+          status: 'approved',
+          created_at: community.created_at,
+          updated_at: community.updated_at
+        });
+      }
+
+      const memberships = Array.from(dedupByUser.values());
+      normalizedMemberships[community.id] = memberships;
+
+      const approvedIds = memberships
+        .filter((membership) => membership.status === 'approved')
+        .map((membership) => membership.user_id);
+
+      const pendingIds = memberships
+        .filter((membership) => membership.status === 'pending')
+        .map((membership) => membership.user_id);
+
+      if (approvedIds.includes(currentUser.id)) joinedSet.add(community.id);
+      approvedMembersByCommunity[community.id] = Array.from(new Set(approvedIds));
+      pendingByCommunity[community.id] = Array.from(new Set(pendingIds));
+      countMap[community.id] = approvedMembersByCommunity[community.id].length;
+      memberships.forEach((membership) => allMemberIds.add(membership.user_id));
     });
 
-    const profiles = await fetchProfilesByIds(allMemberIds);
+    const profiles = await fetchProfilesByIds(Array.from(allMemberIds));
     setProfilesById((prev) => ({ ...prev, ...profiles }));
     setJoinedCommunityIds(Array.from(joinedSet));
-    setMemberIdsByCommunity(membersByCommunity);
+    setPendingRequestsByCommunity(pendingByCommunity);
+    setCommunityMembershipsByCommunity(normalizedMemberships);
+    setMemberIdsByCommunity(approvedMembersByCommunity);
     setMemberCountMap(countMap);
   };
 
@@ -440,6 +589,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
       return {
         ...community,
         genre: getCommunityGenre(community),
+        rules: community.rules || '',
         is_public: community.is_public !== false,
         creator: creatorsById[community.created_by] || null,
         avatar_seed: community.name || 'community',
@@ -456,10 +606,6 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
 
   useEffect(() => {
     fetchCommunities();
-  }, []);
-
-  useEffect(() => {
-    setPendingRequestsByCommunity(getLocalCommunityJoinRequestsState());
   }, []);
 
   useEffect(() => {
@@ -508,6 +654,29 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     () => communities.find((community) => community.id === selectedCommunityId) || null,
     [communities, selectedCommunityId]
   );
+
+  useEffect(() => {
+    if (!selectedCommunity) {
+      setEditingCommunity(false);
+      setCommunityDraft({
+        name: '',
+        description: '',
+        rules: '',
+        genre: COMMUNITY_DEFAULT_GENRES[0],
+        is_public: true
+      });
+      return;
+    }
+
+    setEditingCommunity(false);
+    setCommunityDraft({
+      name: selectedCommunity.name || '',
+      description: selectedCommunity.description || '',
+      rules: selectedCommunity.rules || '',
+      genre: selectedCommunity.genre || COMMUNITY_DEFAULT_GENRES[0],
+      is_public: selectedCommunity.is_public !== false
+    });
+  }, [selectedCommunity]);
 
   useEffect(() => {
     if (!selectedCommunityId) {
@@ -685,52 +854,152 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     setLocalCommunityMembershipState(userId, Array.from(nextJoined));
   };
 
-  const addMemberToCommunity = async (communityId, userId) => {
-    if (membershipBackend === 'remote') {
-      const { error } = await supabase
-        .from('community_members')
-        .insert([{ community_id: communityId, user_id: userId }]);
+  const removeMemberFromLocalState = (communityId, userId) => {
+    const localMembership = getLocalCommunityMembershipState(userId);
+    const nextJoined = new Set(localMembership.joinedIds || []);
+    nextJoined.delete(communityId);
+    setLocalCommunityMembershipState(userId, Array.from(nextJoined));
+  };
 
-      if (!error || error.code === '23505') {
-        await loadMemberships(communities);
-        return true;
+  const getCommunityRoleForUser = (communityId, userId = currentUser.id) => {
+    const community = communities.find((item) => item.id === communityId);
+    if (!community) return 'visitor';
+    if (community.created_by === userId) return 'owner';
+
+    const memberships = communityMembershipsByCommunity[communityId] || [];
+    const membership = memberships.find((item) => item.user_id === userId);
+    if (!membership) return 'visitor';
+    if (membership.status === 'pending') return 'pending';
+    if (membership.status !== 'approved') return 'visitor';
+    return normalizeCommunityRole(membership.role);
+  };
+
+  const canManageMembershipForCommunity = (communityId) => {
+    const role = getCommunityRoleForUser(communityId);
+    return role === 'owner' || role === 'admin' || role === 'mod';
+  };
+
+  const getCommunityManagerRecipientIds = (communityId) => {
+    const community = communities.find((item) => String(item.id) === String(communityId));
+    const recipients = new Set();
+
+    if (community?.created_by) recipients.add(String(community.created_by));
+
+    const memberships = communityMembershipsByCommunity[communityId] || [];
+    memberships.forEach((membership) => {
+      if (membership?.status !== 'approved') return;
+      const role = normalizeCommunityRole(membership.role);
+      if (role === 'admin' || role === 'mod' || role === 'owner') {
+        recipients.add(String(membership.user_id));
       }
-      setMembershipBackend('local');
+    });
+
+    return Array.from(recipients);
+  };
+
+  const insertMembershipRemote = async ({ communityId, userId, role = 'member', status = 'approved', approvedBy = null }) => {
+    await supabase
+      .from('community_members')
+      .delete()
+      .eq('community_id', communityId)
+      .eq('user_id', userId);
+
+    const payload = {
+      community_id: communityId,
+      user_id: userId,
+      role,
+      status
+    };
+
+    if (status === 'approved') {
+      payload.approved_at = new Date().toISOString();
+      payload.approved_by = approvedBy || currentUser.id;
     }
 
-    addMemberToLocalState(communityId, userId);
-    await loadMemberships(communities);
-    return true;
+    return supabase.from('community_members').insert([payload]);
   };
 
   const approveJoinRequest = async (communityId, userId) => {
     const community = communities.find((item) => item.id === communityId);
-    if (!community || community.created_by !== currentUser.id) return;
+    if (!community || !canManageMembershipForCommunity(communityId)) return;
     setJoiningId(`${communityId}-${userId}`);
-    const approved = await addMemberToCommunity(communityId, userId);
-    if (approved) {
-      await createCommunityInviteNotification({
-        recipientId: userId,
-        actorId: currentUser.id,
-        communityId,
-        communityName: community.name
-      });
+
+    if (membershipBackend === 'remote') {
+      const { error } = await supabase
+        .from('community_members')
+        .update({
+          status: 'approved',
+          role: 'member',
+          approved_at: new Date().toISOString(),
+          approved_by: currentUser.id
+        })
+        .eq('community_id', communityId)
+        .eq('user_id', userId)
+        .eq('status', 'pending');
+
+      if (!error) {
+        await loadMemberships(communities);
+        await createCommunityInviteNotification({
+          recipientId: userId,
+          actorId: currentUser.id,
+          communityId,
+          communityName: community.name
+        });
+        setInfoMessage('Membro aprovado com sucesso.');
+        setJoiningId(null);
+        return;
+      }
+
+      setMembershipBackend('local');
     }
+
+    addMemberToLocalState(communityId, userId);
     removeJoinRequest(communityId, userId);
+    await loadMemberships(communities);
+    await createCommunityInviteNotification({
+      recipientId: userId,
+      actorId: currentUser.id,
+      communityId,
+      communityName: community.name
+    });
     setInfoMessage('Membro aprovado com sucesso.');
     setJoiningId(null);
   };
 
-  const rejectJoinRequest = (communityId, userId) => {
+  const rejectJoinRequest = async (communityId, userId) => {
     const community = communities.find((item) => item.id === communityId);
-    if (!community || community.created_by !== currentUser.id) return;
+    if (!community || !canManageMembershipForCommunity(communityId)) return;
+
+    if (membershipBackend === 'remote') {
+      setJoiningId(`${communityId}-${userId}`);
+      const { error } = await supabase
+        .from('community_members')
+        .delete()
+        .eq('community_id', communityId)
+        .eq('user_id', userId)
+        .eq('status', 'pending');
+
+      if (!error) {
+        await loadMemberships(communities);
+        setInfoMessage('Solicitação removida.');
+        setJoiningId(null);
+        return;
+      }
+
+      setMembershipBackend('local');
+      setJoiningId(null);
+    }
+
     const changed = removeJoinRequest(communityId, userId);
+    removeMemberFromLocalState(communityId, userId);
+    await loadMemberships(communities);
     if (changed) setInfoMessage('Solicitação removida.');
   };
 
   const toggleMembership = async (communityId) => {
     const isJoined = joinedCommunityIds.includes(communityId);
     const community = communities.find((item) => item.id === communityId);
+    if (!community) return;
     const isPrivateCommunity = community?.is_public === false;
     const pending = isRequestPending(communityId, currentUser.id);
 
@@ -739,12 +1008,62 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     setErrorMessage('');
 
     if (!isJoined && isPrivateCommunity) {
+      if (membershipBackend === 'remote') {
+        if (pending) {
+          const { error } = await supabase
+            .from('community_members')
+            .delete()
+            .eq('community_id', communityId)
+            .eq('user_id', currentUser.id)
+            .eq('status', 'pending');
+
+          if (!error) {
+            await loadMemberships(communities);
+            setInfoMessage('Solicitação cancelada.');
+            setJoiningId(null);
+            return;
+          }
+        } else {
+          const { error } = await insertMembershipRemote({
+            communityId,
+            userId: currentUser.id,
+            role: 'member',
+            status: 'pending'
+          });
+
+          if (!error) {
+            await loadMemberships(communities);
+            await createCommunityJoinRequestNotifications({
+              recipientIds: getCommunityManagerRecipientIds(communityId),
+              actorId: currentUser.id,
+              communityId,
+              communityName: community.name,
+              requesterHandle: currentUser.handle,
+              requesterName: currentUser.name
+            });
+            setInfoMessage('Solicitação enviada. Aguarde aprovação da moderação.');
+            setJoiningId(null);
+            return;
+          }
+        }
+
+        setMembershipBackend('local');
+      }
+
       if (pending) {
         removeJoinRequest(communityId, currentUser.id);
         setInfoMessage('Solicitação cancelada.');
       } else {
         addJoinRequest(communityId, currentUser.id);
-        setInfoMessage('Solicitação enviada. Aguarde aprovação do criador.');
+        await createCommunityJoinRequestNotifications({
+          recipientIds: getCommunityManagerRecipientIds(communityId),
+          actorId: currentUser.id,
+          communityId,
+          communityName: community.name,
+          requesterHandle: currentUser.handle,
+          requesterName: currentUser.name
+        });
+        setInfoMessage('Solicitação enviada. Aguarde aprovação da moderação.');
       }
       setJoiningId(null);
       return;
@@ -752,14 +1071,24 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
 
     if (membershipBackend === 'remote') {
       const { error } = isJoined
-        ? await supabase.from('community_members').delete().eq('community_id', communityId).eq('user_id', currentUser.id)
-        : await supabase.from('community_members').insert([{ community_id: communityId, user_id: currentUser.id }]);
+        ? await supabase
+          .from('community_members')
+          .delete()
+          .eq('community_id', communityId)
+          .eq('user_id', currentUser.id)
+        : await insertMembershipRemote({
+          communityId,
+          userId: currentUser.id,
+          role: 'member',
+          status: 'approved'
+        });
 
       if (!error) {
         await loadMemberships(communities);
         setJoiningId(null);
         return;
       }
+
       setMembershipBackend('local');
     }
 
@@ -768,6 +1097,8 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     else nextJoined.add(communityId);
     const nextJoinedIds = Array.from(nextJoined);
     setJoinedCommunityIds(nextJoinedIds);
+    if (isJoined) removeMemberFromLocalState(communityId, currentUser.id);
+    else addMemberToLocalState(communityId, currentUser.id);
     setLocalCommunityMembershipState(currentUser.id, nextJoinedIds);
     if (!isJoined) removeJoinRequest(communityId, currentUser.id);
     await loadMemberships(communities);
@@ -780,6 +1111,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     setInfoMessage('');
     const name = newCommunity.name.trim();
     const description = newCommunity.description.trim();
+    const rules = newCommunity.rules.trim();
     if (!name || !description) return;
 
     let insertError = null;
@@ -788,21 +1120,28 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
       .insert([{
         name,
         description,
+        rules,
         created_by: currentUser.id,
         genre: newCommunity.genre,
         is_public: newCommunity.is_public
       }]);
 
     if (withGenre.error) {
-      const withVisibility = await supabase
+      const withRulesVisibility = await supabase
         .from('communities')
-        .insert([{ name, description, created_by: currentUser.id, is_public: newCommunity.is_public }]);
+        .insert([{ name, description, rules, created_by: currentUser.id, is_public: newCommunity.is_public }]);
 
-      if (withVisibility.error) {
-        const fallback = await supabase
+      if (withRulesVisibility.error) {
+        const withVisibility = await supabase
           .from('communities')
-          .insert([{ name, description, created_by: currentUser.id }]);
-        insertError = fallback.error || null;
+          .insert([{ name, description, created_by: currentUser.id, is_public: newCommunity.is_public }]);
+
+        if (withVisibility.error) {
+          const fallback = await supabase
+            .from('communities')
+            .insert([{ name, description, created_by: currentUser.id }]);
+          insertError = fallback.error || null;
+        }
       }
     }
 
@@ -812,9 +1151,71 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     }
 
     setShowCreate(false);
-    setNewCommunity({ name: '', description: '', genre: COMMUNITY_DEFAULT_GENRES[0], is_public: true });
+    setNewCommunity({ name: '', description: '', rules: '', genre: COMMUNITY_DEFAULT_GENRES[0], is_public: true });
     setInfoMessage(newCommunity.is_public ? 'Comunidade pública criada.' : 'Comunidade privada criada.');
     await fetchCommunities();
+  };
+
+  const handleSaveCommunitySettings = async () => {
+    if (!selectedCommunity) return;
+    if (!canManageCommunitySettings) return;
+
+    const payload = {
+      name: communityDraft.name.trim(),
+      description: communityDraft.description.trim(),
+      rules: communityDraft.rules.trim(),
+      genre: communityDraft.genre,
+      is_public: communityDraft.is_public
+    };
+
+    if (!payload.name || !payload.description) {
+      setErrorMessage('Nome e descrição são obrigatórios.');
+      return;
+    }
+
+    setSavingCommunity(true);
+    setErrorMessage('');
+
+    const { error } = await supabase
+      .from('communities')
+      .update(payload)
+      .eq('id', selectedCommunity.id);
+
+    setSavingCommunity(false);
+
+    if (error) {
+      setErrorMessage('Não foi possível salvar as configurações da comunidade.');
+      return;
+    }
+
+    setCommunities((prev) => prev.map((community) => (
+      community.id === selectedCommunity.id ? { ...community, ...payload } : community
+    )));
+    setEditingCommunity(false);
+    setInfoMessage('Comunidade atualizada.');
+  };
+
+  const handleUpdateMemberRole = async (communityId, userId, role) => {
+    if (!canManageMemberRoles) return;
+    const normalizedRole = normalizeCommunityRole(role);
+    if (!['admin', 'mod', 'member'].includes(normalizedRole)) return;
+
+    setUpdatingMemberRoleId(`${communityId}:${userId}`);
+    const { error } = await supabase
+      .from('community_members')
+      .update({ role: normalizedRole })
+      .eq('community_id', communityId)
+      .eq('user_id', userId)
+      .eq('status', 'approved');
+    setUpdatingMemberRoleId('');
+
+    if (error) {
+      setErrorMessage('Não foi possível atualizar o cargo.');
+      return;
+    }
+
+    await loadMemberships(communities);
+    setInfoMessage('Cargo atualizado.');
   };
 
   const handleDeleteCommunity = async (community) => {
@@ -843,7 +1244,9 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     event.target.value = '';
 
     if (!file || !selectedCommunity) return;
-    if (selectedCommunity.created_by !== currentUser.id) return;
+    const currentRole = getCommunityRoleForUser(selectedCommunity.id);
+    const canEditCommunityMedia = currentRole === 'owner' || currentRole === 'admin';
+    if (!canEditCommunityMedia) return;
 
     const isCover = field === 'cover_url';
     setUploadingCommunityMedia(field);
@@ -864,8 +1267,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
       const { error: updateError } = await supabase
         .from('communities')
         .update({ [field]: publicUrl })
-        .eq('id', selectedCommunity.id)
-        .eq('created_by', currentUser.id);
+        .eq('id', selectedCommunity.id);
 
       setLocalCommunityMediaField(selectedCommunity.id, field, publicUrl);
       setCommunities((prev) =>
@@ -914,7 +1316,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
   const handlePublishPost = async (e) => {
     e.preventDefault();
     if (!selectedCommunityId) return;
-    if (selectedCommunity?.created_by !== currentUser.id && !joinedCommunityIds.includes(selectedCommunityId)) {
+    if (!canPostInCommunity) {
       alert('Junte-se à comunidade para fazer uma publicação.');
       return;
     }
@@ -1082,7 +1484,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
   const handleSavePostEdit = async (post) => {
     if (!post || !selectedCommunityId) return;
 
-    const canManagePost = post.user_id === currentUser.id || selectedCommunity?.created_by === currentUser.id;
+    const canManagePost = post.user_id === currentUser.id || canModerateCommunityPosts;
     if (!canManagePost) return;
 
     const spotifyInput = editingPostDraft.spotify_url.trim();
@@ -1116,7 +1518,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
         .eq('id', post.id)
         .eq('community_id', selectedCommunityId);
 
-      if (selectedCommunity?.created_by !== currentUser.id) {
+      if (!canModerateCommunityPosts) {
         query = query.eq('user_id', currentUser.id);
       }
 
@@ -1134,7 +1536,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
   const handleDeletePost = async (post) => {
     if (!post || !selectedCommunityId) return;
 
-    const canManagePost = post.user_id === currentUser.id || selectedCommunity?.created_by === currentUser.id;
+    const canManagePost = post.user_id === currentUser.id || canModerateCommunityPosts;
     if (!canManagePost) return;
     if (!window.confirm('Deseja remover este post da comunidade?')) return;
 
@@ -1152,7 +1554,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
         .eq('id', post.id)
         .eq('community_id', selectedCommunityId);
 
-      if (selectedCommunity?.created_by !== currentUser.id) {
+      if (!canModerateCommunityPosts) {
         query = query.eq('user_id', currentUser.id);
       }
 
@@ -1455,30 +1857,58 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
       .slice(0, 6);
   }, [selectedCommunity, memberIdsByCommunity, postsInPeriod, profilesById]);
 
-  const selectedCommunityPendingRequests = selectedCommunity
-    ? (Array.isArray(pendingRequestsByCommunity[String(selectedCommunity.id)])
-      ? pendingRequestsByCommunity[String(selectedCommunity.id)]
-      : [])
+  const selectedCommunityMemberships = selectedCommunity
+    ? (communityMembershipsByCommunity[selectedCommunity.id] || [])
     : [];
-  const hasPendingRequestForSelected = selectedCommunityPendingRequests.includes(currentUser.id);
-  const selectedRole = selectedCommunity
-    ? (
-      selectedCommunity.created_by === currentUser.id
-        ? 'Criador'
-        : (joinedCommunityIds.includes(selectedCommunity.id)
-          ? 'Membro'
-          : (hasPendingRequestForSelected ? 'Pendente' : 'Visitante'))
-    )
-    : 'Visitante';
 
-  const canViewCommunityContent = selectedRole === 'Criador' || selectedRole === 'Membro';
+  const selectedCommunityPendingRequests = selectedCommunityMemberships
+    .filter((membership) => membership.status === 'pending')
+    .map((membership) => membership.user_id);
+
+  const hasPendingRequestForSelected = selectedCommunityPendingRequests.includes(currentUser.id);
+  const selectedRoleKey = selectedCommunity ? getCommunityRoleForUser(selectedCommunity.id) : 'visitor';
+  const selectedRole = (
+    selectedRoleKey === 'owner'
+      ? 'Owner'
+      : selectedRoleKey === 'admin'
+        ? 'Admin'
+        : selectedRoleKey === 'mod'
+          ? 'Mod'
+          : selectedRoleKey === 'member'
+            ? 'Membro'
+            : selectedRoleKey === 'pending'
+              ? 'Pendente'
+              : 'Visitante'
+  );
+
+  const canViewCommunityContent = ['owner', 'admin', 'mod', 'member'].includes(selectedRoleKey);
   const canPostInCommunity = canViewCommunityContent;
-  const pendingRequestProfiles = selectedCommunityPendingRequests
-    .map((userId) => ({
-      user_id: userId,
-      profile: profilesById[userId] || null
+  const canManageCommunityMembers = ['owner', 'admin', 'mod'].includes(selectedRoleKey);
+  const canManageMemberRoles = ['owner', 'admin'].includes(selectedRoleKey);
+  const canManageCommunitySettings = ['owner', 'admin'].includes(selectedRoleKey);
+  const canModerateCommunityPosts = ['owner', 'admin', 'mod'].includes(selectedRoleKey);
+  const canDeleteCommunity = selectedRoleKey === 'owner';
+
+  const pendingRequestProfiles = selectedCommunityMemberships
+    .filter((membership) => membership.status === 'pending' && membership.user_id && membership.user_id !== selectedCommunity?.created_by)
+    .map((membership) => ({
+      user_id: membership.user_id,
+      created_at: membership.created_at,
+      profile: profilesById[membership.user_id] || null
+    }));
+
+  const manageableMemberProfiles = selectedCommunityMemberships
+    .filter((membership) => membership.status === 'approved')
+    .map((membership) => ({
+      ...membership,
+      role: normalizeCommunityRole(membership.role),
+      profile: profilesById[membership.user_id] || null
     }))
-    .filter((entry) => entry.user_id && entry.user_id !== selectedCommunity?.created_by);
+    .sort((a, b) => {
+      const roleDiff = (COMMUNITY_ROLE_ORDER[a.role] ?? 999) - (COMMUNITY_ROLE_ORDER[b.role] ?? 999);
+      if (roleDiff !== 0) return roleDiff;
+      return String(a.profile?.name || '').localeCompare(String(b.profile?.name || ''));
+    });
   const composerSpotifyPreview = composer.spotify_url.trim() ? parseSpotifyLink(composer.spotify_url) : null;
   const isExclusivePostTab = ['discussao', 'topicos', 'desafios'].includes(activeTab);
   const composerTypeOptions = isExclusivePostTab
@@ -1645,6 +2075,16 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest mb-2">Descrição</label>
                 <textarea placeholder="Sobre o que é esta comunidade?" required value={newCommunity.description} onChange={(e) => setNewCommunity((prev) => ({ ...prev, description: e.target.value }))} className="w-full bg-black border border-slate-800 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-violet-500 resize-none" rows="2" />
               </div>
+              <div className="mb-6">
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest mb-2">Regras (opcional)</label>
+                <textarea
+                  placeholder="Uma regra por linha. Ex: Sem spam"
+                  value={newCommunity.rules}
+                  onChange={(e) => setNewCommunity((prev) => ({ ...prev, rules: e.target.value }))}
+                  className="w-full bg-black border border-slate-800 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-violet-500 resize-none"
+                  rows="3"
+                />
+              </div>
               <div className="flex justify-end">
                 <button type="submit" className="bg-violet-600 hover:bg-violet-500 text-white px-8 py-2.5 rounded-xl font-bold text-sm transition-colors shadow-lg shadow-violet-500/20">
                   Criar e Entrar
@@ -1705,7 +2145,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                   <div className="absolute inset-0 bg-gradient-to-br from-violet-900/40 to-slate-900 opacity-80 backdrop-blur-3xl"></div>
                   <div className="absolute inset-0 bg-gradient-to-t from-slate-900 via-slate-900/40 to-transparent"></div>
                   
-                  {selectedCommunity.created_by === currentUser.id && (
+                  {canManageCommunitySettings && (
                     <>
                       <input
                         ref={coverInputRef}
@@ -1722,9 +2162,11 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                       >
                         {uploadingCommunityMedia === 'cover_url' ? 'A enviar...' : 'Editar capa'}
                       </button>
-                      <button onClick={() => handleDeleteCommunity(selectedCommunity)} className="absolute top-4 right-4 bg-black/50 backdrop-blur-md text-white p-2.5 rounded-full hover:bg-rose-500 hover:text-white transition">
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                      {canDeleteCommunity && (
+                        <button onClick={() => handleDeleteCommunity(selectedCommunity)} className="absolute top-4 right-4 bg-black/50 backdrop-blur-md text-white p-2.5 rounded-full hover:bg-rose-500 hover:text-white transition">
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
                     </>
                   )}
                 </div>
@@ -1737,7 +2179,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                       alt="Logo" 
                       className="w-32 h-32 sm:w-40 sm:h-40 rounded-2xl border-4 border-slate-900 object-cover shadow-2xl bg-black"
                     />
-                    {selectedCommunity.created_by === currentUser.id && (
+                    {canManageCommunitySettings && (
                       <>
                         <input
                           ref={avatarInputRef}
@@ -1762,7 +2204,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                   <div className="flex-1 text-center sm:text-left mb-2">
                     <h1 className="text-3xl sm:text-4xl font-extrabold text-white flex items-center justify-center sm:justify-start gap-2">
                       {selectedCommunity.name}
-                      {selectedCommunity.created_by === currentUser.id && <Award className="w-6 h-6 text-fuchsia-500" />}
+                      {selectedRoleKey === 'owner' && <Award className="w-6 h-6 text-fuchsia-500" />}
                     </h1>
                     <div className="flex flex-wrap items-center justify-center sm:justify-start gap-3 mt-2 text-slate-400 text-sm font-medium">
                       <span className="flex items-center gap-1"><Globe className="w-4 h-4" /> {selectedCommunity.is_public ? 'Público' : 'Privado'}</span>
@@ -1770,14 +2212,16 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                       <span className="flex items-center gap-1"><Users className="w-4 h-4" /> {memberCountMap[selectedCommunity.id] || 0} membros</span>
                       <span className="hidden sm:inline">•</span>
                       <span className="text-fuchsia-400">{selectedCommunity.genre}</span>
+                      <span className="hidden sm:inline">•</span>
+                      <span>{selectedRole}</span>
                     </div>
                   </div>
 
                   <div className="flex gap-3 mb-2 w-full sm:w-auto shrink-0">
-                    {selectedCommunity.created_by === currentUser.id ? (
+                    {selectedRoleKey === 'owner' ? (
                       <div className="flex-1 sm:flex-none bg-slate-800 text-slate-300 px-6 py-2.5 rounded-xl font-semibold flex items-center justify-center gap-2 cursor-default border border-slate-700">
                         <Crown className="w-5 h-5 text-amber-400" />
-                        Admin
+                        Owner
                       </div>
                     ) : (
                       <button 
@@ -2074,7 +2518,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                       const isCopiedPostLink = copiedPostId === postIdKey;
                       const isHighlightedPost = highlightedPostId === postIdKey;
                       const isEditingPost = editingPostId === postIdKey;
-                      const canManagePost = post.user_id === currentUser.id || selectedCommunity?.created_by === currentUser.id;
+                      const canManagePost = post.user_id === currentUser.id || canModerateCommunityPosts;
                       
                       return (
                         <div
@@ -2100,7 +2544,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                                 <h3 className="text-slate-100 font-bold text-[15px] hover:underline flex items-center gap-1.5">
                                   {author?.name || 'Usuário'}
                                   {author?.id === selectedCommunity.created_by && (
-                                    <span className="bg-white text-black text-[9px] px-1.5 py-0.5 rounded-sm uppercase font-black">Admin</span>
+                                    <span className="bg-white text-black text-[9px] px-1.5 py-0.5 rounded-sm uppercase font-black">Owner</span>
                                   )}
                                 </h3>
                                 <div className="flex items-center gap-1 text-slate-400 text-xs">
@@ -2397,7 +2841,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
 
                 {/* RIGHT COLUMN - SIDEBAR */}
                 <div className="w-full lg:w-[340px] shrink-0 flex flex-col gap-6">
-                  {selectedCommunity.created_by === currentUser.id && !selectedCommunity.is_public && (
+                  {canManageCommunityMembers && !selectedCommunity.is_public && (
                     <div className="bg-slate-900 rounded-2xl p-5 border border-slate-800">
                       <h2 className="text-lg font-bold text-white mb-3">Solicitações de Entrada</h2>
                       {pendingRequestProfiles.length === 0 ? (
@@ -2441,6 +2885,125 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                       )}
                     </div>
                   )}
+
+                  {canManageCommunitySettings && (
+                    <div className="bg-slate-900 rounded-2xl p-5 border border-slate-800">
+                      <div className="flex items-center justify-between gap-2 mb-3">
+                        <h2 className="text-lg font-bold text-white">Gestão da Comunidade</h2>
+                        <button
+                          type="button"
+                          onClick={() => setEditingCommunity((prev) => !prev)}
+                          className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg font-semibold"
+                        >
+                          {editingCommunity ? 'Cancelar' : 'Editar'}
+                        </button>
+                      </div>
+
+                      {editingCommunity ? (
+                        <div className="space-y-3">
+                          <input
+                            type="text"
+                            value={communityDraft.name}
+                            onChange={(event) => setCommunityDraft((prev) => ({ ...prev, name: event.target.value }))}
+                            placeholder="Nome da comunidade"
+                            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-500"
+                          />
+                          <textarea
+                            value={communityDraft.description}
+                            onChange={(event) => setCommunityDraft((prev) => ({ ...prev, description: event.target.value }))}
+                            placeholder="Descrição"
+                            rows={3}
+                            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-500 resize-none"
+                          />
+                          <textarea
+                            value={communityDraft.rules}
+                            onChange={(event) => setCommunityDraft((prev) => ({ ...prev, rules: event.target.value }))}
+                            placeholder="Regras da comunidade (uma por linha)"
+                            rows={4}
+                            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-500 resize-none"
+                          />
+                          <div className="grid grid-cols-2 gap-2">
+                            <select
+                              value={communityDraft.genre}
+                              onChange={(event) => setCommunityDraft((prev) => ({ ...prev, genre: event.target.value }))}
+                              className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-500"
+                            >
+                              {COMMUNITY_DEFAULT_GENRES.map((genre) => <option key={genre} value={genre}>{genre}</option>)}
+                            </select>
+                            <select
+                              value={communityDraft.is_public ? 'public' : 'private'}
+                              onChange={(event) => setCommunityDraft((prev) => ({ ...prev, is_public: event.target.value === 'public' }))}
+                              className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-500"
+                            >
+                              <option value="public">Pública</option>
+                              <option value="private">Privada</option>
+                            </select>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={handleSaveCommunitySettings}
+                            disabled={savingCommunity}
+                            className="w-full bg-violet-600 hover:bg-violet-500 text-white text-sm font-semibold rounded-lg py-2 disabled:opacity-60"
+                          >
+                            {savingCommunity ? 'Salvando...' : 'Salvar alterações'}
+                          </button>
+                        </div>
+                      ) : (
+                        <p className="text-sm text-slate-400">
+                          Gerencie nome, descrição, regras e visibilidade da comunidade.
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {canManageMemberRoles && (
+                    <div className="bg-slate-900 rounded-2xl p-5 border border-slate-800">
+                      <h2 className="text-lg font-bold text-white mb-3">Cargos de Membros</h2>
+                      <div className="flex flex-col gap-2 max-h-[300px] overflow-y-auto pr-1 custom-scrollbar">
+                        {manageableMemberProfiles.map((member) => {
+                          const memberRole = normalizeCommunityRole(member.role);
+                          const isOwnerRow = member.user_id === selectedCommunity.created_by || memberRole === 'owner';
+                          const isAdminEditingAdmin = selectedRoleKey === 'admin' && memberRole === 'admin';
+                          const canEditRole = !isOwnerRow && !isAdminEditingAdmin;
+                          const roleOptions = selectedRoleKey === 'owner'
+                            ? ['admin', 'mod', 'member']
+                            : ['mod', 'member'];
+
+                          return (
+                            <div key={`member-role-${member.user_id}`} className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 flex items-center gap-3">
+                              <img
+                                src={member.profile?.avatar_url || `https://api.dicebear.com/7.x/initials/svg?seed=${member.profile?.name || 'U'}`}
+                                alt={member.profile?.name || 'Usuário'}
+                                className="w-9 h-9 rounded-full object-cover bg-slate-800 border border-slate-700"
+                              />
+                              <div className="min-w-0 flex-1">
+                                <p className="text-sm font-semibold text-slate-200 truncate">{member.profile?.name || 'Usuário'}</p>
+                                <p className="text-xs text-slate-500 truncate">{member.profile?.handle || '@usuario'}</p>
+                              </div>
+                              {canEditRole ? (
+                                <select
+                                  value={memberRole}
+                                  onChange={(event) => handleUpdateMemberRole(selectedCommunity.id, member.user_id, event.target.value)}
+                                  disabled={updatingMemberRoleId === `${selectedCommunity.id}:${member.user_id}`}
+                                  className="bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-100 outline-none focus:border-violet-500 disabled:opacity-60"
+                                >
+                                  {roleOptions.map((roleOption) => (
+                                    <option key={roleOption} value={roleOption}>
+                                      {COMMUNITY_ROLE_LABELS[roleOption]}
+                                    </option>
+                                  ))}
+                                </select>
+                              ) : (
+                                <span className="text-xs px-2 py-1 rounded-md border border-slate-700 bg-slate-800 text-slate-300">
+                                  {COMMUNITY_ROLE_LABELS[memberRole] || 'Membro'}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                   
                   {/* About Section */}
                   <div className="bg-slate-900 rounded-2xl p-5 border border-slate-800">
@@ -2448,14 +3011,26 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                     <p className="text-slate-400 text-sm leading-relaxed mb-4">
                       {selectedCommunity.description}
                     </p>
+                    <div className="mb-4">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Regras</p>
+                      {selectedCommunity.rules?.trim() ? (
+                        <ul className="space-y-1">
+                          {selectedCommunity.rules
+                            .split('\n')
+                            .map((line) => line.trim())
+                            .filter(Boolean)
+                            .map((rule, index) => (
+                              <li key={`rule-${index}`} className="text-sm text-slate-300 leading-relaxed">• {rule}</li>
+                            ))}
+                        </ul>
+                      ) : (
+                        <p className="text-sm text-slate-500">Nenhuma regra cadastrada.</p>
+                      )}
+                    </div>
                     <div className="flex items-center gap-2 text-slate-300 text-sm mb-4">
                       <Disc className="w-5 h-5 text-fuchsia-400" />
                       <span>Criada em {new Date(selectedCommunity.created_at).toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' })}</span>
                     </div>
-                    {/* Add fake "Ler mais" or extra functionality button */}
-                    <button className="w-full bg-slate-800 hover:bg-slate-700 text-white py-2 rounded-xl text-sm font-semibold transition-colors">
-                      Ler mais
-                    </button>
                   </div>
 
                   {/* Trending Tags (Dynamic from genre/name for display) */}
@@ -2522,7 +3097,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                   <p className="text-slate-400 text-sm mb-6">
                     Apenas membros podem ver posts, rankings e tópicos desta comunidade.
                   </p>
-                  {selectedCommunity.created_by !== currentUser.id && (
+                  {!['owner', 'admin', 'mod', 'member'].includes(selectedRoleKey) && (
                     <button
                       type="button"
                       onClick={() => toggleMembership(selectedCommunity.id)}
