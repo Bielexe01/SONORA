@@ -281,6 +281,33 @@ const parseYouTubeLink = (rawUrl) => {
   };
 };
 
+const clampPercent = (value, fallback = 50) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(100, Math.max(0, Math.round(parsed)));
+};
+
+const parseLocalDateTimeToIso = (localDateTime) => {
+  if (!localDateTime) return null;
+  const match = String(localDateTime).trim().match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+  if (!match) return null;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const parsedDate = new Date(year, month - 1, day, hour, minute, 0);
+  if (Number.isNaN(parsedDate.getTime())) return null;
+  return parsedDate.toISOString();
+};
+
+const buildGoogleMapsSearchUrl = (rawAddress) => {
+  const address = String(rawAddress || '').trim();
+  if (!address) return '';
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`;
+};
+
 const getSpotifyEmbedHeight = (type) => (type === 'track' || type === 'episode' ? 152 : 352);
 
 const getLocalCommunityMembershipState = (userId) => {
@@ -2096,7 +2123,9 @@ function ShoppingView({ currentUser, onOpenProfile }) {
     category: '',
     location: '',
     purchase_url: '',
-    image_url: ''
+    image_url: '',
+    image_position_x: 50,
+    image_position_y: 50
   });
   const [imageFile, setImageFile] = useState(null);
   const [imagePreview, setImagePreview] = useState('');
@@ -2154,6 +2183,8 @@ function ShoppingView({ currentUser, onOpenProfile }) {
     const location = newItem.location.trim();
     const purchaseUrl = newItem.purchase_url.trim();
     let imageUrl = newItem.image_url.trim();
+    const imagePositionX = clampPercent(newItem.image_position_x, 50);
+    const imagePositionY = clampPercent(newItem.image_position_y, 50);
 
     if (!title || !Number.isFinite(price) || price < 0) {
       setErrorMessage('Preencha titulo e preco valido.');
@@ -2184,6 +2215,8 @@ function ShoppingView({ currentUser, onOpenProfile }) {
       location: location || null,
       purchase_url: purchaseUrl || null,
       image_url: imageUrl || null,
+      image_position_x: imagePositionX,
+      image_position_y: imagePositionY,
       is_active: true
     }]);
 
@@ -2203,7 +2236,9 @@ function ShoppingView({ currentUser, onOpenProfile }) {
       category: '',
       location: '',
       purchase_url: '',
-      image_url: ''
+      image_url: '',
+      image_position_x: 50,
+      image_position_y: 50
     });
     clearSelectedImage();
     await fetchListings();
@@ -2272,6 +2307,30 @@ function ShoppingView({ currentUser, onOpenProfile }) {
           </div>
           <textarea value={newItem.description} onChange={(event) => setNewItem((prev) => ({ ...prev, description: event.target.value }))} rows={3} placeholder="Descricao do produto..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500 resize-none" />
           <input type="text" value={newItem.image_url} onChange={(event) => setNewItem((prev) => ({ ...prev, image_url: event.target.value }))} placeholder="URL da imagem (opcional)" className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label className="text-xs text-zinc-400">
+              Posicao horizontal da imagem ({clampPercent(newItem.image_position_x, 50)}%)
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={clampPercent(newItem.image_position_x, 50)}
+                onChange={(event) => setNewItem((prev) => ({ ...prev, image_position_x: Number(event.target.value) }))}
+                className="w-full mt-1"
+              />
+            </label>
+            <label className="text-xs text-zinc-400">
+              Posicao vertical da imagem ({clampPercent(newItem.image_position_y, 50)}%)
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={clampPercent(newItem.image_position_y, 50)}
+                onChange={(event) => setNewItem((prev) => ({ ...prev, image_position_y: Number(event.target.value) }))}
+                className="w-full mt-1"
+              />
+            </label>
+          </div>
           <div className="flex flex-wrap items-center gap-2">
             <input ref={imageInputRef} type="file" accept="image/*" onChange={handleImageChange} className="hidden" />
             <button type="button" onClick={() => imageInputRef.current?.click()} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-800 text-zinc-200 hover:bg-zinc-700 text-sm font-medium">
@@ -2285,7 +2344,13 @@ function ShoppingView({ currentUser, onOpenProfile }) {
               </button>
             )}
           </div>
-          {(imagePreview || newItem.image_url.trim()) && <img src={imagePreview || newItem.image_url.trim()} className="w-full max-h-64 object-cover rounded-xl border border-zinc-800" />}
+          {(imagePreview || newItem.image_url.trim()) && (
+            <img
+              src={imagePreview || newItem.image_url.trim()}
+              className="w-full max-h-64 object-cover rounded-xl border border-zinc-800"
+              style={{ objectPosition: `${clampPercent(newItem.image_position_x, 50)}% ${clampPercent(newItem.image_position_y, 50)}%` }}
+            />
+          )}
           <button disabled={saving} type="submit" className="bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white px-6 py-2.5 rounded-xl font-semibold">{saving ? 'Publicando...' : 'Publicar anuncio'}</button>
         </form>
       )}
@@ -2295,7 +2360,15 @@ function ShoppingView({ currentUser, onOpenProfile }) {
         {!loading && filteredListings.length === 0 && <p className="text-sm text-zinc-500">Nenhum anuncio encontrado.</p>}
         {!loading && filteredListings.map((item) => (
           <div key={item.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
-            {item.image_url ? <img src={item.image_url} className="w-full h-48 object-cover bg-zinc-950" /> : <div className="w-full h-48 bg-zinc-950 flex items-center justify-center text-zinc-500"><ShoppingBag className="w-10 h-10 opacity-60" /></div>}
+            {item.image_url ? (
+              <img
+                src={item.image_url}
+                className="w-full h-48 object-cover bg-zinc-950"
+                style={{ objectPosition: `${clampPercent(item.image_position_x, 50)}% ${clampPercent(item.image_position_y, 50)}%` }}
+              />
+            ) : (
+              <div className="w-full h-48 bg-zinc-950 flex items-center justify-center text-zinc-500"><ShoppingBag className="w-10 h-10 opacity-60" /></div>
+            )}
             <div className="p-4">
               <div className="flex items-start justify-between gap-3">
                 <h3 className="text-lg font-bold text-white">{item.title}</h3>
@@ -2316,13 +2389,20 @@ function ShoppingView({ currentUser, onOpenProfile }) {
                 <button type="button" onClick={() => item.profiles?.id && onOpenProfile?.(item.profiles)} className="text-xs text-zinc-400 hover:text-violet-300 transition-colors">
                   {item.profiles?.name || 'Usuario'} {item.profiles?.handle || ''}
                 </button>
-                {item.purchase_url ? (
-                  <a href={item.purchase_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white">
-                    Comprar
-                  </a>
-                ) : (
-                  <span className="text-xs text-zinc-500">Sem link de compra</span>
-                )}
+                <div className="flex flex-wrap gap-2 justify-end">
+                  {item.location && (
+                    <a href={buildGoogleMapsSearchUrl(item.location)} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">
+                      Maps
+                    </a>
+                  )}
+                  {item.purchase_url ? (
+                    <a href={item.purchase_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white">
+                      Comprar
+                    </a>
+                  ) : (
+                    <span className="text-xs text-zinc-500">Sem link de compra</span>
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -2352,7 +2432,9 @@ function EventsView({ currentUser, onOpenProfile }) {
     contact_url: '',
     needs_artists: false,
     artist_requirements: '',
-    cover_url: ''
+    cover_url: '',
+    cover_position_x: 50,
+    cover_position_y: 50
   });
   const [coverFile, setCoverFile] = useState(null);
   const [coverPreview, setCoverPreview] = useState('');
@@ -2409,7 +2491,10 @@ function EventsView({ currentUser, onOpenProfile }) {
     const ticketUrl = newEvent.ticket_url.trim();
     const contactUrl = newEvent.contact_url.trim();
     const artistRequirements = newEvent.artist_requirements.trim();
-    const eventDateIso = newEvent.event_date ? new Date(newEvent.event_date).toISOString() : null;
+    const eventDateIso = parseLocalDateTimeToIso(newEvent.event_date);
+    const eventTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+    const coverPositionX = clampPercent(newEvent.cover_position_x, 50);
+    const coverPositionY = clampPercent(newEvent.cover_position_y, 50);
     let coverUrl = newEvent.cover_url.trim();
 
     if (!title || !venue || !city || !eventDateIso || Number.isNaN(new Date(eventDateIso).getTime())) {
@@ -2443,7 +2528,10 @@ function EventsView({ currentUser, onOpenProfile }) {
       contact_url: contactUrl || null,
       needs_artists: Boolean(newEvent.needs_artists),
       artist_requirements: newEvent.needs_artists ? (artistRequirements || null) : null,
-      cover_url: coverUrl || null
+      cover_url: coverUrl || null,
+      cover_position_x: coverPositionX,
+      cover_position_y: coverPositionY,
+      event_timezone: eventTimezone
     }]);
 
     if (error) {
@@ -2465,7 +2553,9 @@ function EventsView({ currentUser, onOpenProfile }) {
       contact_url: '',
       needs_artists: false,
       artist_requirements: '',
-      cover_url: ''
+      cover_url: '',
+      cover_position_x: 50,
+      cover_position_y: 50
     });
     clearSelectedCover();
     await fetchEvents();
@@ -2492,6 +2582,18 @@ function EventsView({ currentUser, onOpenProfile }) {
       || (artistFilter === 'no-needs' && !item.needs_artists);
     return queryMatch && artistMatch;
   });
+
+  const formatEventDate = (eventDate, timezone) => {
+    if (!eventDate) return 'Data nao informada';
+    const parsedDate = new Date(eventDate);
+    if (Number.isNaN(parsedDate.getTime())) return 'Data invalida';
+    const options = {
+      dateStyle: 'short',
+      timeStyle: 'short'
+    };
+    if (timezone) options.timeZone = timezone;
+    return new Intl.DateTimeFormat('pt-BR', options).format(parsedDate);
+  };
 
   return (
     <div className="p-4 md:p-8">
@@ -2531,6 +2633,28 @@ function EventsView({ currentUser, onOpenProfile }) {
             <input type="text" value={newEvent.ticket_url} onChange={(event) => setNewEvent((prev) => ({ ...prev, ticket_url: event.target.value }))} placeholder="Link para compra de ingressos" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
             <input type="text" value={newEvent.contact_url} onChange={(event) => setNewEvent((prev) => ({ ...prev, contact_url: event.target.value }))} placeholder="Link de contato" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
             <input type="text" value={newEvent.cover_url} onChange={(event) => setNewEvent((prev) => ({ ...prev, cover_url: event.target.value }))} placeholder="URL da capa (opcional)" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <label className="text-xs text-zinc-400">
+              Posicao horizontal da capa ({clampPercent(newEvent.cover_position_x, 50)}%)
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={clampPercent(newEvent.cover_position_x, 50)}
+                onChange={(event) => setNewEvent((prev) => ({ ...prev, cover_position_x: Number(event.target.value) }))}
+                className="w-full mt-1"
+              />
+            </label>
+            <label className="text-xs text-zinc-400">
+              Posicao vertical da capa ({clampPercent(newEvent.cover_position_y, 50)}%)
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={clampPercent(newEvent.cover_position_y, 50)}
+                onChange={(event) => setNewEvent((prev) => ({ ...prev, cover_position_y: Number(event.target.value) }))}
+                className="w-full mt-1"
+              />
+            </label>
           </div>
           <textarea value={newEvent.description} onChange={(event) => setNewEvent((prev) => ({ ...prev, description: event.target.value }))} rows={3} placeholder="Descricao do evento..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500 resize-none" />
           <label className="inline-flex items-center gap-2 text-sm text-zinc-300">
@@ -2553,7 +2677,13 @@ function EventsView({ currentUser, onOpenProfile }) {
               </button>
             )}
           </div>
-          {(coverPreview || newEvent.cover_url.trim()) && <img src={coverPreview || newEvent.cover_url.trim()} className="w-full max-h-64 object-cover rounded-xl border border-zinc-800" />}
+          {(coverPreview || newEvent.cover_url.trim()) && (
+            <img
+              src={coverPreview || newEvent.cover_url.trim()}
+              className="w-full max-h-64 object-cover rounded-xl border border-zinc-800"
+              style={{ objectPosition: `${clampPercent(newEvent.cover_position_x, 50)}% ${clampPercent(newEvent.cover_position_y, 50)}%` }}
+            />
+          )}
           <button disabled={saving} type="submit" className="bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white px-6 py-2.5 rounded-xl font-semibold">{saving ? 'Publicando...' : 'Publicar evento'}</button>
         </form>
       )}
@@ -2563,12 +2693,18 @@ function EventsView({ currentUser, onOpenProfile }) {
         {!loading && filteredEvents.length === 0 && <p className="text-sm text-zinc-500">Nenhum evento encontrado.</p>}
         {!loading && filteredEvents.map((item) => (
           <div key={item.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
-            {item.cover_url && <img src={item.cover_url} className="w-full h-44 object-cover bg-zinc-950" />}
+            {item.cover_url && (
+              <img
+                src={item.cover_url}
+                className="w-full h-44 object-cover bg-zinc-950"
+                style={{ objectPosition: `${clampPercent(item.cover_position_x, 50)}% ${clampPercent(item.cover_position_y, 50)}%` }}
+              />
+            )}
             <div className="p-4 md:p-5">
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <h3 className="text-lg font-bold text-white">{item.title}</h3>
-                  <p className="text-sm text-zinc-400 mt-1">{new Date(item.event_date).toLocaleString()} • {item.venue}, {item.city}</p>
+                  <p className="text-sm text-zinc-400 mt-1">{formatEventDate(item.event_date, item.event_timezone)} • {item.venue}, {item.city}</p>
                 </div>
                 {item.organizer_id === currentUser.id && (
                   <button disabled={deletingId === item.id} onClick={() => handleDeleteEvent(item.id)} className="text-zinc-500 hover:text-red-400 disabled:opacity-50" title="Remover evento">
@@ -2592,6 +2728,11 @@ function EventsView({ currentUser, onOpenProfile }) {
                   Organizador: {item.profiles?.name || 'Usuario'} {item.profiles?.handle || ''}
                 </button>
                 <div className="flex flex-wrap gap-2">
+                  {(item.venue || item.city) && (
+                    <a href={buildGoogleMapsSearchUrl(`${item.venue || ''}, ${item.city || ''}`)} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">
+                      Maps
+                    </a>
+                  )}
                   {item.ticket_url && <a href={item.ticket_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm font-semibold px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white"><Ticket className="w-4 h-4" />Ingressos</a>}
                   {item.contact_url && <a href={item.contact_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">Contato</a>}
                 </div>
