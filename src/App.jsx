@@ -4,7 +4,8 @@ import {
   Heart, MessageSquare, Share2, Play, Music, Edit3, 
   Check, X, Search, PlusCircle, Headphones, Star, Award, 
   LogOut, Image as ImageIcon, Link as LinkIcon, Trash2, Send, Camera, Chrome,
-  Mail, Lock, Eye, EyeOff, Github, ChevronRight, Disc
+  Mail, Lock, Eye, EyeOff, Github, ChevronRight, Disc,
+  ShoppingBag, CalendarDays, MapPin, Ticket
 } from 'lucide-react';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.3/+esm';
 import { motion, useMotionValue, useSpring } from 'framer-motion';
@@ -22,7 +23,7 @@ const ASCENSAO_POSTS_STORAGE_KEY = 'sonora_ascensao_posts';
 const ASCENSAO_LIKES_STORAGE_KEY = 'sonora_ascensao_likes';
 const USER_FOLLOWS_STORAGE_KEY = 'sonora_user_follows';
 const COMMUNITY_DEFAULT_GENRES = ['Rock', 'Pop', 'Rap', 'Eletronica', 'Gospel', 'MPB'];
-const AVAILABLE_APP_TABS = new Set(['feed', 'direct', 'communities', 'playlists', 'ascensao', 'profile']);
+const AVAILABLE_APP_TABS = new Set(['feed', 'direct', 'communities', 'playlists', 'shopping', 'events', 'ascensao', 'profile']);
 const SPOTIFY_CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID || '';
 const SPOTIFY_TOKEN_STORAGE_KEY = 'spotify_token';
 const SPOTIFY_AUTH_DATA_STORAGE_KEY = 'sonora_spotify_auth_data';
@@ -33,6 +34,8 @@ const APP_NAV_ITEMS = [
   { id: 'direct', label: 'Direct', icon: MessageCircle },
   { id: 'communities', label: 'Comunidades', icon: Users },
   { id: 'playlists', label: 'Playlists', icon: ListMusic },
+  { id: 'shopping', label: 'Shopping', icon: ShoppingBag },
+  { id: 'events', label: 'Eventos', icon: CalendarDays },
   { id: 'ascensao', label: 'Ascensao', icon: TrendingUp },
   { id: 'profile', label: 'Perfil', icon: User }
 ];
@@ -689,6 +692,8 @@ export default function App() {
           {activeTab === 'direct' && <DirectView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'communities' && <CommunitiesHub currentUser={currentUser} onOpenDirect={() => setActiveTab('direct')} onOpenProfile={openProfile} />}
           {activeTab === 'playlists' && <PlaylistsView currentUser={currentUser} onOpenProfile={openProfile} />}
+          {activeTab === 'shopping' && <ShoppingView currentUser={currentUser} onOpenProfile={openProfile} />}
+          {activeTab === 'events' && <EventsView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'ascensao' && <AscensaoView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'profile' && (
             <ProfileView
@@ -2070,6 +2075,530 @@ function PlaylistsView({ currentUser, onOpenProfile }) {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+function ShoppingView({ currentUser, onOpenProfile }) {
+  const [listings, setListings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [deletingId, setDeletingId] = useState(null);
+  const [newItem, setNewItem] = useState({
+    title: '',
+    description: '',
+    price: '',
+    condition: 'used',
+    category: '',
+    location: '',
+    purchase_url: '',
+    image_url: ''
+  });
+  const [imageFile, setImageFile] = useState(null);
+  const [imagePreview, setImagePreview] = useState('');
+  const imageInputRef = useRef(null);
+
+  useEffect(() => {
+    fetchListings();
+  }, []);
+
+  const fetchListings = async () => {
+    setLoading(true);
+    setErrorMessage('');
+
+    const { data, error } = await supabase
+      .from('marketplace_listings')
+      .select('*, profiles!marketplace_listings_seller_id_fkey(id, name, handle, avatar_url)')
+      .eq('is_active', true)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      setErrorMessage('Nao foi possivel carregar Shopping. Verifique a tabela marketplace_listings no banco.');
+      setListings([]);
+      setLoading(false);
+      return;
+    }
+
+    setListings(data || []);
+    setLoading(false);
+  };
+
+  const clearSelectedImage = () => {
+    if (imagePreview && imagePreview.startsWith('blob:')) URL.revokeObjectURL(imagePreview);
+    setImageFile(null);
+    setImagePreview('');
+  };
+
+  const handleImageChange = (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    clearSelectedImage();
+    setImageFile(file);
+    setImagePreview(URL.createObjectURL(file));
+  };
+
+  const handleCreateListing = async (event) => {
+    event.preventDefault();
+    if (saving) return;
+
+    const title = newItem.title.trim();
+    const description = newItem.description.trim();
+    const price = Number(String(newItem.price).replace(',', '.'));
+    const condition = newItem.condition === 'new' ? 'new' : 'used';
+    const category = newItem.category.trim();
+    const location = newItem.location.trim();
+    const purchaseUrl = newItem.purchase_url.trim();
+    let imageUrl = newItem.image_url.trim();
+
+    if (!title || !Number.isFinite(price) || price < 0) {
+      setErrorMessage('Preencha titulo e preco valido.');
+      return;
+    }
+
+    if (imageFile) {
+      try {
+        const ext = (imageFile.name.split('.').pop() || 'jpg').toLowerCase();
+        const path = `shopping/${currentUser.id}/${Date.now()}.${ext}`;
+        const { data: uploadData, error: uploadError } = await supabase.storage.from('media').upload(path, imageFile, { upsert: true });
+        if (uploadError || !uploadData?.path) throw new Error(uploadError?.message || 'Upload falhou');
+        imageUrl = supabase.storage.from('media').getPublicUrl(uploadData.path).data.publicUrl;
+      } catch {
+        setErrorMessage('Falha ao enviar imagem do anuncio.');
+        return;
+      }
+    }
+
+    setSaving(true);
+    const { error } = await supabase.from('marketplace_listings').insert([{
+      seller_id: currentUser.id,
+      title,
+      description: description || null,
+      price,
+      condition,
+      category: category || null,
+      location: location || null,
+      purchase_url: purchaseUrl || null,
+      image_url: imageUrl || null,
+      is_active: true
+    }]);
+
+    if (error) {
+      setErrorMessage('Nao foi possivel publicar o anuncio.');
+      setSaving(false);
+      return;
+    }
+
+    setShowCreate(false);
+    setSaving(false);
+    setNewItem({
+      title: '',
+      description: '',
+      price: '',
+      condition: 'used',
+      category: '',
+      location: '',
+      purchase_url: '',
+      image_url: ''
+    });
+    clearSelectedImage();
+    await fetchListings();
+  };
+
+  const handleDeleteListing = async (listingId) => {
+    if (!window.confirm('Deseja remover este anuncio?')) return;
+    setDeletingId(listingId);
+    const { error } = await supabase.from('marketplace_listings').delete().eq('id', listingId).eq('seller_id', currentUser.id);
+    if (error) {
+      setErrorMessage('Nao foi possivel remover este anuncio.');
+      setDeletingId(null);
+      return;
+    }
+    setDeletingId(null);
+    await fetchListings();
+  };
+
+  const filteredListings = listings.filter((item) => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return true;
+    return (
+      item.title?.toLowerCase().includes(query)
+      || item.description?.toLowerCase().includes(query)
+      || item.location?.toLowerCase().includes(query)
+      || item.category?.toLowerCase().includes(query)
+    );
+  });
+
+  const formatBRL = (value) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(Number(value || 0));
+
+  return (
+    <div className="p-4 md:p-8">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
+        <div>
+          <h2 className="text-2xl font-bold text-white flex items-center gap-2"><ShoppingBag className="w-6 h-6 text-violet-400" /> Shopping</h2>
+          <p className="text-zinc-400 text-sm">Venda e compre instrumentos musicais.</p>
+        </div>
+        <button onClick={() => setShowCreate((prev) => !prev)} className="bg-violet-600 hover:bg-violet-700 text-white px-4 py-2 rounded-lg font-medium flex items-center transition-colors">
+          {showCreate ? <X className="w-5 h-5 mr-2" /> : <PlusCircle className="w-5 h-5 mr-2" />}
+          {showCreate ? 'Cancelar' : 'Novo anuncio'}
+        </button>
+      </div>
+
+      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-6">
+        <div className="relative w-full md:max-w-sm">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+          <input type="text" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Buscar instrumento..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl pl-9 pr-3 py-2 text-sm text-white focus:border-violet-500 outline-none" />
+        </div>
+      </div>
+
+      {errorMessage && <div className="mb-6 bg-red-500/10 border border-red-500/30 text-red-300 rounded-xl px-4 py-3 text-sm">{errorMessage}</div>}
+
+      {showCreate && (
+        <form onSubmit={handleCreateListing} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 md:p-6 mb-8 space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <input type="text" required value={newItem.title} onChange={(event) => setNewItem((prev) => ({ ...prev, title: event.target.value }))} placeholder="Titulo do anuncio" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="text" required value={newItem.price} onChange={(event) => setNewItem((prev) => ({ ...prev, price: event.target.value }))} placeholder="Preco (ex: 2999.90)" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="text" value={newItem.category} onChange={(event) => setNewItem((prev) => ({ ...prev, category: event.target.value }))} placeholder="Categoria (guitarra, teclado...)" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="text" value={newItem.location} onChange={(event) => setNewItem((prev) => ({ ...prev, location: event.target.value }))} placeholder="Cidade / Estado" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <select value={newItem.condition} onChange={(event) => setNewItem((prev) => ({ ...prev, condition: event.target.value }))} className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500">
+              <option value="used">Usado</option>
+              <option value="new">Novo</option>
+            </select>
+            <input type="text" value={newItem.purchase_url} onChange={(event) => setNewItem((prev) => ({ ...prev, purchase_url: event.target.value }))} placeholder="Link de compra/contato" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+          </div>
+          <textarea value={newItem.description} onChange={(event) => setNewItem((prev) => ({ ...prev, description: event.target.value }))} rows={3} placeholder="Descricao do produto..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500 resize-none" />
+          <input type="text" value={newItem.image_url} onChange={(event) => setNewItem((prev) => ({ ...prev, image_url: event.target.value }))} placeholder="URL da imagem (opcional)" className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+          <div className="flex flex-wrap items-center gap-2">
+            <input ref={imageInputRef} type="file" accept="image/*" onChange={handleImageChange} className="hidden" />
+            <button type="button" onClick={() => imageInputRef.current?.click()} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-800 text-zinc-200 hover:bg-zinc-700 text-sm font-medium">
+              <ImageIcon className="w-4 h-4" />
+              Enviar foto
+            </button>
+            {imageFile && (
+              <button type="button" onClick={clearSelectedImage} className="inline-flex items-center gap-1 px-3 py-2 rounded-lg bg-zinc-800 text-zinc-300 hover:text-red-300 hover:bg-zinc-700 text-sm">
+                <X className="w-4 h-4" />
+                Remover
+              </button>
+            )}
+          </div>
+          {(imagePreview || newItem.image_url.trim()) && <img src={imagePreview || newItem.image_url.trim()} className="w-full max-h-64 object-cover rounded-xl border border-zinc-800" />}
+          <button disabled={saving} type="submit" className="bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white px-6 py-2.5 rounded-xl font-semibold">{saving ? 'Publicando...' : 'Publicar anuncio'}</button>
+        </form>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+        {loading && <p className="text-sm text-zinc-500">Carregando anuncios...</p>}
+        {!loading && filteredListings.length === 0 && <p className="text-sm text-zinc-500">Nenhum anuncio encontrado.</p>}
+        {!loading && filteredListings.map((item) => (
+          <div key={item.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
+            {item.image_url ? <img src={item.image_url} className="w-full h-48 object-cover bg-zinc-950" /> : <div className="w-full h-48 bg-zinc-950 flex items-center justify-center text-zinc-500"><ShoppingBag className="w-10 h-10 opacity-60" /></div>}
+            <div className="p-4">
+              <div className="flex items-start justify-between gap-3">
+                <h3 className="text-lg font-bold text-white">{item.title}</h3>
+                {item.seller_id === currentUser.id && (
+                  <button disabled={deletingId === item.id} onClick={() => handleDeleteListing(item.id)} className="text-zinc-500 hover:text-red-400 disabled:opacity-50" title="Remover anuncio">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+              <p className="text-violet-300 font-bold mt-1">{formatBRL(item.price)}</p>
+              <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-300">{item.condition === 'new' ? 'Novo' : 'Usado'}</span>
+                {item.category && <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-300">{item.category}</span>}
+                {item.location && <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-300 inline-flex items-center gap-1"><MapPin className="w-3 h-3" />{item.location}</span>}
+              </div>
+              {item.description && <p className="text-sm text-zinc-300 mt-3 line-clamp-3">{item.description}</p>}
+              <div className="mt-4 flex items-center justify-between gap-2">
+                <button type="button" onClick={() => item.profiles?.id && onOpenProfile?.(item.profiles)} className="text-xs text-zinc-400 hover:text-violet-300 transition-colors">
+                  {item.profiles?.name || 'Usuario'} {item.profiles?.handle || ''}
+                </button>
+                {item.purchase_url ? (
+                  <a href={item.purchase_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white">
+                    Comprar
+                  </a>
+                ) : (
+                  <span className="text-xs text-zinc-500">Sem link de compra</span>
+                )}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EventsView({ currentUser, onOpenProfile }) {
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [artistFilter, setArtistFilter] = useState('all');
+  const [deletingId, setDeletingId] = useState(null);
+  const [newEvent, setNewEvent] = useState({
+    title: '',
+    description: '',
+    event_date: '',
+    venue: '',
+    city: '',
+    genre: '',
+    ticket_url: '',
+    contact_url: '',
+    needs_artists: false,
+    artist_requirements: '',
+    cover_url: ''
+  });
+  const [coverFile, setCoverFile] = useState(null);
+  const [coverPreview, setCoverPreview] = useState('');
+  const coverInputRef = useRef(null);
+
+  useEffect(() => {
+    fetchEvents();
+  }, []);
+
+  const fetchEvents = async () => {
+    setLoading(true);
+    setErrorMessage('');
+
+    const { data, error } = await supabase
+      .from('music_events')
+      .select('*, profiles!music_events_organizer_id_fkey(id, name, handle, avatar_url)')
+      .order('event_date', { ascending: true });
+
+    if (error) {
+      setErrorMessage('Nao foi possivel carregar eventos. Verifique a tabela music_events no banco.');
+      setEvents([]);
+      setLoading(false);
+      return;
+    }
+
+    setEvents(data || []);
+    setLoading(false);
+  };
+
+  const clearSelectedCover = () => {
+    if (coverPreview && coverPreview.startsWith('blob:')) URL.revokeObjectURL(coverPreview);
+    setCoverFile(null);
+    setCoverPreview('');
+  };
+
+  const handleCoverChange = (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    clearSelectedCover();
+    setCoverFile(file);
+    setCoverPreview(URL.createObjectURL(file));
+  };
+
+  const handleCreateEvent = async (event) => {
+    event.preventDefault();
+    if (saving) return;
+
+    const title = newEvent.title.trim();
+    const description = newEvent.description.trim();
+    const venue = newEvent.venue.trim();
+    const city = newEvent.city.trim();
+    const genre = newEvent.genre.trim();
+    const ticketUrl = newEvent.ticket_url.trim();
+    const contactUrl = newEvent.contact_url.trim();
+    const artistRequirements = newEvent.artist_requirements.trim();
+    const eventDateIso = newEvent.event_date ? new Date(newEvent.event_date).toISOString() : null;
+    let coverUrl = newEvent.cover_url.trim();
+
+    if (!title || !venue || !city || !eventDateIso || Number.isNaN(new Date(eventDateIso).getTime())) {
+      setErrorMessage('Preencha titulo, data, local e cidade do evento.');
+      return;
+    }
+
+    if (coverFile) {
+      try {
+        const ext = (coverFile.name.split('.').pop() || 'jpg').toLowerCase();
+        const path = `events/${currentUser.id}/${Date.now()}.${ext}`;
+        const { data: uploadData, error: uploadError } = await supabase.storage.from('media').upload(path, coverFile, { upsert: true });
+        if (uploadError || !uploadData?.path) throw new Error(uploadError?.message || 'Upload falhou');
+        coverUrl = supabase.storage.from('media').getPublicUrl(uploadData.path).data.publicUrl;
+      } catch {
+        setErrorMessage('Falha ao enviar capa do evento.');
+        return;
+      }
+    }
+
+    setSaving(true);
+    const { error } = await supabase.from('music_events').insert([{
+      organizer_id: currentUser.id,
+      title,
+      description: description || null,
+      event_date: eventDateIso,
+      venue,
+      city,
+      genre: genre || null,
+      ticket_url: ticketUrl || null,
+      contact_url: contactUrl || null,
+      needs_artists: Boolean(newEvent.needs_artists),
+      artist_requirements: newEvent.needs_artists ? (artistRequirements || null) : null,
+      cover_url: coverUrl || null
+    }]);
+
+    if (error) {
+      setErrorMessage('Nao foi possivel publicar o evento.');
+      setSaving(false);
+      return;
+    }
+
+    setShowCreate(false);
+    setSaving(false);
+    setNewEvent({
+      title: '',
+      description: '',
+      event_date: '',
+      venue: '',
+      city: '',
+      genre: '',
+      ticket_url: '',
+      contact_url: '',
+      needs_artists: false,
+      artist_requirements: '',
+      cover_url: ''
+    });
+    clearSelectedCover();
+    await fetchEvents();
+  };
+
+  const handleDeleteEvent = async (eventId) => {
+    if (!window.confirm('Deseja remover este evento?')) return;
+    setDeletingId(eventId);
+    const { error } = await supabase.from('music_events').delete().eq('id', eventId).eq('organizer_id', currentUser.id);
+    if (error) {
+      setErrorMessage('Nao foi possivel remover este evento.');
+      setDeletingId(null);
+      return;
+    }
+    setDeletingId(null);
+    await fetchEvents();
+  };
+
+  const filteredEvents = events.filter((item) => {
+    const query = searchQuery.trim().toLowerCase();
+    const queryMatch = !query || item.title?.toLowerCase().includes(query) || item.city?.toLowerCase().includes(query) || item.venue?.toLowerCase().includes(query);
+    const artistMatch = artistFilter === 'all'
+      || (artistFilter === 'needs' && item.needs_artists)
+      || (artistFilter === 'no-needs' && !item.needs_artists);
+    return queryMatch && artistMatch;
+  });
+
+  return (
+    <div className="p-4 md:p-8">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
+        <div>
+          <h2 className="text-2xl font-bold text-white flex items-center gap-2"><CalendarDays className="w-6 h-6 text-violet-400" /> Eventos</h2>
+          <p className="text-zinc-400 text-sm">Veja local, ingresso e se o evento precisa de artistas.</p>
+        </div>
+        <button onClick={() => setShowCreate((prev) => !prev)} className="bg-violet-600 hover:bg-violet-700 text-white px-4 py-2 rounded-lg font-medium flex items-center transition-colors">
+          {showCreate ? <X className="w-5 h-5 mr-2" /> : <PlusCircle className="w-5 h-5 mr-2" />}
+          {showCreate ? 'Cancelar' : 'Novo evento'}
+        </button>
+      </div>
+
+      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-6 flex flex-col md:flex-row gap-3 md:items-center md:justify-between">
+        <div className="relative w-full md:max-w-sm">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+          <input type="text" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Buscar por evento, local ou cidade..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl pl-9 pr-3 py-2 text-sm text-white focus:border-violet-500 outline-none" />
+        </div>
+        <select value={artistFilter} onChange={(event) => setArtistFilter(event.target.value)} className="bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-sm text-white focus:border-violet-500 outline-none">
+          <option value="all">Todos</option>
+          <option value="needs">Precisam de artistas</option>
+          <option value="no-needs">Nao precisam de artistas</option>
+        </select>
+      </div>
+
+      {errorMessage && <div className="mb-6 bg-red-500/10 border border-red-500/30 text-red-300 rounded-xl px-4 py-3 text-sm">{errorMessage}</div>}
+
+      {showCreate && (
+        <form onSubmit={handleCreateEvent} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 md:p-6 mb-8 space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <input type="text" required value={newEvent.title} onChange={(event) => setNewEvent((prev) => ({ ...prev, title: event.target.value }))} placeholder="Titulo do evento" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="datetime-local" required value={newEvent.event_date} onChange={(event) => setNewEvent((prev) => ({ ...prev, event_date: event.target.value }))} className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="text" required value={newEvent.venue} onChange={(event) => setNewEvent((prev) => ({ ...prev, venue: event.target.value }))} placeholder="Local do evento" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="text" required value={newEvent.city} onChange={(event) => setNewEvent((prev) => ({ ...prev, city: event.target.value }))} placeholder="Cidade / Estado" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="text" value={newEvent.genre} onChange={(event) => setNewEvent((prev) => ({ ...prev, genre: event.target.value }))} placeholder="Genero (opcional)" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="text" value={newEvent.ticket_url} onChange={(event) => setNewEvent((prev) => ({ ...prev, ticket_url: event.target.value }))} placeholder="Link para compra de ingressos" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="text" value={newEvent.contact_url} onChange={(event) => setNewEvent((prev) => ({ ...prev, contact_url: event.target.value }))} placeholder="Link de contato" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+            <input type="text" value={newEvent.cover_url} onChange={(event) => setNewEvent((prev) => ({ ...prev, cover_url: event.target.value }))} placeholder="URL da capa (opcional)" className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white outline-none focus:border-violet-500" />
+          </div>
+          <textarea value={newEvent.description} onChange={(event) => setNewEvent((prev) => ({ ...prev, description: event.target.value }))} rows={3} placeholder="Descricao do evento..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500 resize-none" />
+          <label className="inline-flex items-center gap-2 text-sm text-zinc-300">
+            <input type="checkbox" checked={newEvent.needs_artists} onChange={(event) => setNewEvent((prev) => ({ ...prev, needs_artists: event.target.checked }))} className="rounded border-zinc-700 bg-zinc-900 text-violet-500 focus:ring-violet-500/50" />
+            Precisa de artistas para este evento
+          </label>
+          {newEvent.needs_artists && (
+            <textarea value={newEvent.artist_requirements} onChange={(event) => setNewEvent((prev) => ({ ...prev, artist_requirements: event.target.value }))} rows={2} placeholder="Requisitos para artistas..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500 resize-none" />
+          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <input ref={coverInputRef} type="file" accept="image/*" onChange={handleCoverChange} className="hidden" />
+            <button type="button" onClick={() => coverInputRef.current?.click()} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-800 text-zinc-200 hover:bg-zinc-700 text-sm font-medium">
+              <ImageIcon className="w-4 h-4" />
+              Enviar capa
+            </button>
+            {coverFile && (
+              <button type="button" onClick={clearSelectedCover} className="inline-flex items-center gap-1 px-3 py-2 rounded-lg bg-zinc-800 text-zinc-300 hover:text-red-300 hover:bg-zinc-700 text-sm">
+                <X className="w-4 h-4" />
+                Remover
+              </button>
+            )}
+          </div>
+          {(coverPreview || newEvent.cover_url.trim()) && <img src={coverPreview || newEvent.cover_url.trim()} className="w-full max-h-64 object-cover rounded-xl border border-zinc-800" />}
+          <button disabled={saving} type="submit" className="bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white px-6 py-2.5 rounded-xl font-semibold">{saving ? 'Publicando...' : 'Publicar evento'}</button>
+        </form>
+      )}
+
+      <div className="space-y-4">
+        {loading && <p className="text-sm text-zinc-500">Carregando eventos...</p>}
+        {!loading && filteredEvents.length === 0 && <p className="text-sm text-zinc-500">Nenhum evento encontrado.</p>}
+        {!loading && filteredEvents.map((item) => (
+          <div key={item.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
+            {item.cover_url && <img src={item.cover_url} className="w-full h-44 object-cover bg-zinc-950" />}
+            <div className="p-4 md:p-5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-bold text-white">{item.title}</h3>
+                  <p className="text-sm text-zinc-400 mt-1">{new Date(item.event_date).toLocaleString()} • {item.venue}, {item.city}</p>
+                </div>
+                {item.organizer_id === currentUser.id && (
+                  <button disabled={deletingId === item.id} onClick={() => handleDeleteEvent(item.id)} className="text-zinc-500 hover:text-red-400 disabled:opacity-50" title="Remover evento">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2 text-[11px]">
+                {item.genre && <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-300">{item.genre}</span>}
+                {item.needs_artists ? <span className="px-2 py-1 rounded-md bg-emerald-500/20 text-emerald-300">Precisa de artistas</span> : <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-400">Sem vagas para artistas</span>}
+              </div>
+              {item.description && <p className="text-sm text-zinc-300 mt-3 whitespace-pre-wrap">{item.description}</p>}
+              {item.needs_artists && item.artist_requirements && (
+                <div className="mt-3 bg-zinc-950 border border-zinc-800 rounded-xl p-3">
+                  <p className="text-xs text-emerald-300 font-semibold mb-1">Requisitos para artistas</p>
+                  <p className="text-sm text-zinc-300 whitespace-pre-wrap">{item.artist_requirements}</p>
+                </div>
+              )}
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
+                <button type="button" onClick={() => item.profiles?.id && onOpenProfile?.(item.profiles)} className="text-xs text-zinc-400 hover:text-violet-300 transition-colors">
+                  Organizador: {item.profiles?.name || 'Usuario'} {item.profiles?.handle || ''}
+                </button>
+                <div className="flex flex-wrap gap-2">
+                  {item.ticket_url && <a href={item.ticket_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm font-semibold px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white"><Ticket className="w-4 h-4" />Ingressos</a>}
+                  {item.contact_url && <a href={item.contact_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">Contato</a>}
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -3555,7 +4084,7 @@ function MobileBottomNav({ items, activeTab, onSelect }) {
       className="md:hidden fixed bottom-0 inset-x-0 z-40 border-t border-zinc-800 bg-zinc-950/95 backdrop-blur"
       style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 0.35rem)' }}
     >
-      <div className="grid grid-cols-6 gap-1 px-1 pt-1.5">
+      <div className="grid gap-1 px-1 pt-1.5" style={{ gridTemplateColumns: `repeat(${Math.max(1, items.length)}, minmax(0, 1fr))` }}>
         {items.map((item) => {
           const Icon = item.icon;
           const isActive = activeTab === item.id;
