@@ -2515,7 +2515,9 @@ function ShoppingView({ currentUser, onOpenProfile }) {
   };
 
   const parseNumberFilter = (rawValue) => {
-    const normalized = Number(String(rawValue || '').replace(',', '.'));
+    const text = String(rawValue ?? '').trim();
+    if (!text) return null;
+    const normalized = Number(text.replace(',', '.'));
     return Number.isFinite(normalized) ? normalized : null;
   };
 
