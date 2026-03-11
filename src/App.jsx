@@ -3,9 +3,11 @@ import {
   Home, MessageCircle, Users, ListMusic, TrendingUp, User, 
   Heart, MessageSquare, Share2, Play, Music, Edit3, 
   Check, X, Search, PlusCircle, Headphones, Star, Award, 
-  LogOut, Image as ImageIcon, Link as LinkIcon, Trash2, Send, Camera, Chrome
+  LogOut, Image as ImageIcon, Link as LinkIcon, Trash2, Send, Camera, Chrome,
+  Mail, Lock, Eye, EyeOff, Github, ChevronRight, Disc
 } from 'lucide-react';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.3/+esm';
+import { motion, useMotionValue, useSpring } from 'framer-motion';
 import CommunitiesHub from './CommunitiesHub.jsx';
 
 // Inicializacao do Supabase (utilizando as variaveis de ambiente do Vite)
@@ -546,18 +548,141 @@ export default function App() {
 
 // --- SUB-VIEWS ---
 
+const AnimatedBackground = () => {
+  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+  const baseX = useMotionValue(0);
+  const baseY = useMotionValue(0);
+  const inverseX = useMotionValue(0);
+  const inverseY = useMotionValue(0);
+  const springConfig = { damping: 25, stiffness: 150 };
+  const mouseX = useSpring(baseX, springConfig);
+  const mouseY = useSpring(baseY, springConfig);
+  const mouseInverseX = useSpring(inverseX, springConfig);
+  const mouseInverseY = useSpring(inverseY, springConfig);
+
+  useEffect(() => {
+    const handleMouseMove = (event) => {
+      const x = (event.clientX / window.innerWidth) - 0.5;
+      const y = (event.clientY / window.innerHeight) - 0.5;
+      setMousePos({ x, y });
+      baseX.set(x * 100);
+      baseY.set(y * 100);
+      inverseX.set(x * -150);
+      inverseY.set(y * -150);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    return () => window.removeEventListener('mousemove', handleMouseMove);
+  }, [baseX, baseY, inverseX, inverseY]);
+
+  return (
+    <div className="fixed inset-0 -z-10 overflow-hidden bg-slate-950">
+      <motion.div
+        style={{ x: mouseX, y: mouseY }}
+        animate={{ scale: [1, 1.1, 1] }}
+        transition={{ duration: 10, repeat: Infinity, ease: 'linear' }}
+        className="absolute -top-24 -left-24 w-[500px] h-[500px] bg-violet-600/20 rounded-full blur-[120px]"
+      />
+      <motion.div
+        style={{ x: mouseInverseX, y: mouseInverseY }}
+        animate={{ scale: [1, 1.2, 1] }}
+        transition={{ duration: 12, repeat: Infinity, ease: 'linear' }}
+        className="absolute top-1/2 -right-24 w-96 h-96 bg-blue-600/10 rounded-full blur-[100px]"
+      />
+
+      {Array.from({ length: 12 }).map((_, index) => (
+        <motion.div
+          key={`login-float-${index}`}
+          initial={{ opacity: 0, y: '110vh' }}
+          animate={{
+            opacity: [0, 0.35, 0],
+            y: '-10vh',
+            x: `${(index * 8) + 10}vw`,
+            rotate: [0, 360]
+          }}
+          transition={{
+            duration: 15 + (index % 5),
+            repeat: Infinity,
+            delay: index * 2,
+            ease: 'linear'
+          }}
+          className="absolute text-white/5 pointer-events-none"
+        >
+          {index % 3 === 0 ? <Music size={32} /> : index % 3 === 1 ? <Disc size={28} /> : <Headphones size={24} />}
+        </motion.div>
+      ))}
+
+      <div className="absolute bottom-0 left-0 w-full h-40 flex items-end justify-around px-2 opacity-30 pointer-events-none">
+        {Array.from({ length: 30 }).map((_, index) => {
+          const barX = (index / 30) - 0.5;
+          const distance = Math.abs(barX - mousePos.x);
+          const intensity = Math.max(0, 1 - distance * 2);
+          return (
+            <motion.div
+              key={`login-bar-${index}`}
+              animate={{
+                height: [20, (Math.random() * 60) + (intensity * 80) + 20, 20],
+                backgroundColor: intensity > 0.5 ? '#a855f7' : '#3b82f6'
+              }}
+              transition={{ duration: 0.4 + (index % 3) * 0.1, repeat: Infinity, ease: 'easeInOut' }}
+              className="w-1 md:w-2 bg-gradient-to-t from-transparent to-current rounded-t-full transition-colors duration-500"
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+const InputField = ({
+  label,
+  type,
+  icon: Icon,
+  placeholder,
+  value,
+  onChange,
+  showToggle = false,
+  onToggle = null
+}) => (
+  <div className="space-y-2">
+    <label className="text-sm font-medium text-slate-400 ml-1">{label}</label>
+    <div className="relative group">
+      <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none transition-colors group-focus-within:text-violet-400 text-slate-500">
+        <Icon size={18} />
+      </div>
+      <input
+        type={type}
+        value={value}
+        onChange={onChange}
+        className="block w-full pl-10 pr-10 py-3 bg-white/5 border border-white/10 rounded-xl focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500 outline-none transition-all text-white placeholder:text-slate-600 backdrop-blur-md"
+        placeholder={placeholder}
+      />
+      {showToggle && (
+        <button
+          type="button"
+          onClick={onToggle}
+          className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-500 hover:text-white transition-colors"
+        >
+          {type === 'password' ? <Eye size={18} /> : <EyeOff size={18} />}
+        </button>
+      )}
+    </div>
+  </div>
+);
+
 function LoginScreen() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [isLogin, setIsLogin] = useState(true);
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
 
   const getAuthRedirectUrl = () => `${window.location.origin}/`;
 
-  const handleAuth = async (e) => {
-    e.preventDefault();
+  const handleAuth = async (event) => {
+    event.preventDefault();
     setLoading(true);
     try {
       if (isLogin) {
@@ -600,38 +725,151 @@ function LoginScreen() {
     }
   };
 
+  const containerVariants = {
+    hidden: { opacity: 0, scale: 0.95 },
+    visible: {
+      opacity: 1,
+      scale: 1,
+      transition: { duration: 0.5, staggerChildren: 0.1, ease: 'easeOut' }
+    }
+  };
+
+  const itemVariants = {
+    hidden: { opacity: 0, y: 10 },
+    visible: { opacity: 1, y: 0 }
+  };
+
   return (
-    <div className="min-h-screen bg-zinc-950 flex flex-col items-center justify-center p-4">
-      <div className="w-full max-w-md bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl text-center">
-        <Headphones className="w-16 h-16 text-violet-500 mx-auto mb-6" />
-        <h1 className="text-3xl font-bold text-white mb-2">Sonora</h1>
-        <p className="text-zinc-400 mb-8">A sua rede social de musica.</p>
-        <form onSubmit={handleAuth} className="space-y-4 mb-5">
-          {!isLogin && <input type="text" placeholder="Nome Artistico" required value={name} onChange={e => setName(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500" />}
-          <input type="email" placeholder="Email" required value={email} onChange={e => setEmail(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500" />
-          <input type="password" placeholder="Palavra-passe" required value={password} onChange={e => setPassword(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-500" />
-          <button disabled={loading} type="submit" className="w-full bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white font-semibold py-3 px-4 rounded-xl transition-all flex items-center justify-center">
-            {loading ? 'A processar...' : (isLogin ? 'Entrar' : 'Criar Conta')}
-          </button>
-        </form>
-        <div className="flex items-center gap-3 text-xs text-zinc-600 mb-5">
-          <div className="h-px bg-zinc-800 flex-1"></div>
-          <span>ou</span>
-          <div className="h-px bg-zinc-800 flex-1"></div>
-        </div>
-        <button
-          type="button"
-          onClick={handleGoogleLogin}
-          disabled={googleLoading}
-          className="w-full mb-6 bg-white hover:bg-zinc-200 disabled:opacity-60 text-zinc-950 font-semibold py-3 px-4 rounded-xl transition-all flex items-center justify-center gap-2"
+    <div className="min-h-screen flex items-center justify-center p-6 font-sans text-slate-200 selection:bg-violet-500/30">
+      <AnimatedBackground />
+
+      <motion.div initial="hidden" animate="visible" variants={containerVariants} className="w-full max-w-md relative">
+        <motion.div variants={itemVariants} className="text-center mb-8">
+          <motion.div
+            whileHover={{ rotate: 15, scale: 1.1 }}
+            className="inline-flex items-center justify-center p-4 bg-gradient-to-br from-violet-600 to-blue-600 rounded-3xl shadow-2xl shadow-violet-500/30 mb-6"
+          >
+            <Headphones size={38} className="text-white" />
+          </motion.div>
+          <h1 className="text-5xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-b from-white to-slate-500">
+            SONORA
+          </h1>
+          <p className="text-slate-400 mt-2 font-medium tracking-wide">Onde a musica encontra a conexao.</p>
+        </motion.div>
+
+        <motion.div
+          variants={itemVariants}
+          className="bg-slate-900/40 backdrop-blur-2xl border border-white/10 rounded-[2.5rem] shadow-2xl overflow-hidden relative group"
         >
-          <Chrome className="w-5 h-5" />
-          {googleLoading ? 'A redirecionar...' : 'Entrar com Google'}
-        </button>
-        <button type="button" onClick={() => setIsLogin(!isLogin)} className="text-zinc-500 hover:text-white text-sm">
-          {isLogin ? 'Nao tem conta? Crie uma' : 'Ja tem conta? Inicie sessao'}
-        </button>
-      </div>
+          <div className="absolute inset-0 border border-violet-500/0 group-hover:border-violet-500/20 transition-colors duration-700 pointer-events-none rounded-[2.5rem]" />
+
+          <div className="p-8 md:p-10">
+            <form onSubmit={handleAuth} className="space-y-6">
+              {!isLogin && (
+                <InputField
+                  label="Nome artistico"
+                  type="text"
+                  icon={Music}
+                  placeholder="Seu nome no Sonora"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                />
+              )}
+
+              <InputField
+                label="Email"
+                type="email"
+                icon={Mail}
+                placeholder="exemplo@sonora.com"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+              />
+
+              <InputField
+                label="Palavra-passe"
+                type={showPassword ? 'text' : 'password'}
+                icon={Lock}
+                placeholder="••••••••"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                showToggle
+                onToggle={() => setShowPassword((prev) => !prev)}
+              />
+
+              <div className="flex items-center justify-end">
+                <button type="button" className="text-xs font-semibold text-violet-400 hover:text-white transition-all uppercase tracking-widest">
+                  Esqueceu a senha?
+                </button>
+              </div>
+
+              <motion.button
+                whileHover={{ scale: 1.02, boxShadow: '0 20px 25px -5px rgb(168 85 247 / 0.4)' }}
+                whileTap={{ scale: 0.98 }}
+                type="submit"
+                disabled={loading}
+                className="w-full py-4 px-6 bg-gradient-to-r from-violet-600 to-blue-600 text-white font-bold rounded-2xl shadow-lg transition-all flex items-center justify-center gap-3 group disabled:opacity-70"
+              >
+                {loading ? (
+                  <div className="w-6 h-6 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <>
+                    <span className="tracking-wide">{isLogin ? 'ENTRAR NA VIBE' : 'CRIAR PERFIL'}</span>
+                    <ChevronRight size={20} className="group-hover:translate-x-1 transition-transform" />
+                  </>
+                )}
+              </motion.button>
+            </form>
+
+            <div className="relative my-10">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-white/5"></div>
+              </div>
+              <div className="relative flex justify-center text-[10px] uppercase tracking-[0.2em]">
+                <span className="bg-[#0b1120] px-3 text-slate-500 font-bold">Ou sintonizar com</span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <motion.button
+                type="button"
+                whileHover={{ y: -2, backgroundColor: 'rgba(255,255,255,0.08)' }}
+                onClick={handleGoogleLogin}
+                disabled={googleLoading}
+                className="flex items-center justify-center gap-2 py-3 px-4 bg-white/5 border border-white/10 rounded-2xl transition-all text-sm font-bold disabled:opacity-60"
+              >
+                <Chrome size={18} className="text-red-400" />
+                {googleLoading ? 'Abrindo...' : 'Google'}
+              </motion.button>
+              <motion.button
+                type="button"
+                whileHover={{ y: -2, backgroundColor: 'rgba(255,255,255,0.08)' }}
+                className="flex items-center justify-center gap-2 py-3 px-4 bg-white/5 border border-white/10 rounded-2xl transition-all text-sm font-bold opacity-60"
+                title="Em breve"
+              >
+                <Github size={18} />
+                Github
+              </motion.button>
+            </div>
+          </div>
+
+          <div className="p-6 bg-white/[0.02] border-t border-white/5 text-center">
+            <p className="text-sm text-slate-400 font-medium">
+              {isLogin ? 'Ainda nao faz parte?' : 'Ja e da familia?'}
+              <button type="button" onClick={() => setIsLogin((prev) => !prev)} className="ml-2 text-violet-400 font-bold hover:text-white transition-colors">
+                {isLogin ? 'Registe-se' : 'Entrar'}
+              </button>
+            </p>
+          </div>
+        </motion.div>
+
+        <motion.div variants={itemVariants} className="mt-10 text-center space-y-6">
+          <div className="flex justify-center gap-8 text-[11px] font-bold uppercase tracking-widest text-slate-500">
+            <a href="#" className="hover:text-violet-400 transition-colors">Termos</a>
+            <a href="#" className="hover:text-violet-400 transition-colors">Privacidade</a>
+            <a href="#" className="hover:text-violet-400 transition-colors">Cookies</a>
+          </div>
+        </motion.div>
+      </motion.div>
     </div>
   );
 }
