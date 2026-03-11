@@ -23,7 +23,7 @@ const ASCENSAO_LIKES_STORAGE_KEY = 'sonora_ascensao_likes';
 const USER_FOLLOWS_STORAGE_KEY = 'sonora_user_follows';
 const COMMUNITY_DEFAULT_GENRES = ['Rock', 'Pop', 'Rap', 'Eletronica', 'Gospel', 'MPB'];
 const AVAILABLE_APP_TABS = new Set(['feed', 'direct', 'communities', 'playlists', 'ascensao', 'profile']);
-const SPOTIFY_CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID || 'aeed4c6250654ee6b74e806422f15a3b';
+const SPOTIFY_CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID || '';
 const SPOTIFY_TOKEN_STORAGE_KEY = 'spotify_token';
 const SPOTIFY_AUTH_DATA_STORAGE_KEY = 'sonora_spotify_auth_data';
 const SPOTIFY_PKCE_VERIFIER_STORAGE_KEY = 'sonora_spotify_pkce_verifier';
@@ -81,6 +81,7 @@ const createCodeChallenge = async (verifier) => {
 };
 
 const exchangeSpotifyCodeForTokens = async ({ code, codeVerifier }) => {
+  if (!SPOTIFY_CLIENT_ID) throw new Error('Spotify client id ausente.');
   const payload = new URLSearchParams({
     client_id: SPOTIFY_CLIENT_ID,
     grant_type: 'authorization_code',
@@ -102,7 +103,7 @@ const exchangeSpotifyCodeForTokens = async ({ code, codeVerifier }) => {
 };
 
 const refreshSpotifyAccessToken = async (refreshToken) => {
-  if (!refreshToken) return null;
+  if (!refreshToken || !SPOTIFY_CLIENT_ID) return null;
 
   const payload = new URLSearchParams({
     client_id: SPOTIFY_CLIENT_ID,
@@ -2977,6 +2978,10 @@ function ProfileView({ user, setUser, viewerUser }) {
 
   const handleSpotifyConnect = async () => {
     try {
+      if (!SPOTIFY_CLIENT_ID) {
+        alert('Configure VITE_SPOTIFY_CLIENT_ID para ligar o Spotify.');
+        return;
+      }
       const codeVerifier = createRandomString(96);
       const state = createRandomString(32);
       const codeChallenge = await createCodeChallenge(codeVerifier);
