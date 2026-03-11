@@ -2115,6 +2115,7 @@ function ShoppingView({ currentUser, onOpenProfile }) {
   const [errorMessage, setErrorMessage] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [deletingId, setDeletingId] = useState(null);
+  const [mapModal, setMapModal] = useState({ open: false, title: '', query: '' });
   const [newItem, setNewItem] = useState({
     title: '',
     description: '',
@@ -2274,6 +2275,10 @@ function ShoppingView({ currentUser, onOpenProfile }) {
   const shoppingMapEmbedUrl = shoppingMapQuery
     ? `https://www.google.com/maps?q=${encodeURIComponent(shoppingMapQuery)}&output=embed`
     : '';
+  const openMapModal = (title, query) => {
+    if (!String(query || '').trim()) return;
+    setMapModal({ open: true, title: title || 'Mapa', query: String(query).trim() });
+  };
 
   return (
     <div className="p-4 md:p-8">
@@ -2324,6 +2329,14 @@ function ShoppingView({ currentUser, onOpenProfile }) {
               >
                 Escolher no Maps
               </a>
+              <button
+                type="button"
+                onClick={() => openMapModal('Preview do local', shoppingMapQuery)}
+                disabled={!shoppingMapQuery}
+                className={`text-xs px-2 py-1 rounded-md ${shoppingMapQuery ? 'bg-violet-600 text-white hover:bg-violet-700' : 'bg-zinc-900 text-zinc-600 cursor-not-allowed'}`}
+              >
+                Abrir no app
+              </button>
             </div>
             {shoppingMapEmbedUrl && (
               <iframe
@@ -2420,9 +2433,18 @@ function ShoppingView({ currentUser, onOpenProfile }) {
                 </button>
                 <div className="flex flex-wrap gap-2 justify-end">
                   {item.location && (
-                    <a href={buildGoogleMapsSearchUrl(item.location)} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">
-                      Maps
-                    </a>
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => openMapModal(item.title || 'Local do anuncio', item.location)}
+                        className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100"
+                      >
+                        Maps
+                      </button>
+                      <a href={buildGoogleMapsSearchUrl(item.location)} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-zinc-200">
+                        Abrir
+                      </a>
+                    </>
                   )}
                   {item.purchase_url ? (
                     <a href={item.purchase_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white">
@@ -2437,6 +2459,12 @@ function ShoppingView({ currentUser, onOpenProfile }) {
           </div>
         ))}
       </div>
+      <MapsModal
+        isOpen={mapModal.open}
+        title={mapModal.title}
+        query={mapModal.query}
+        onClose={() => setMapModal({ open: false, title: '', query: '' })}
+      />
     </div>
   );
 }
@@ -2450,6 +2478,7 @@ function EventsView({ currentUser, onOpenProfile }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [artistFilter, setArtistFilter] = useState('all');
   const [deletingId, setDeletingId] = useState(null);
+  const [mapModal, setMapModal] = useState({ open: false, title: '', query: '' });
   const [newEvent, setNewEvent] = useState({
     title: '',
     description: '',
@@ -2628,6 +2657,10 @@ function EventsView({ currentUser, onOpenProfile }) {
   const eventMapEmbedUrl = eventMapQuery
     ? `https://www.google.com/maps?q=${encodeURIComponent(eventMapQuery)}&output=embed`
     : '';
+  const openMapModal = (title, query) => {
+    if (!String(query || '').trim()) return;
+    setMapModal({ open: true, title: title || 'Mapa', query: String(query).trim() });
+  };
 
   return (
     <div className="p-4 md:p-8">
@@ -2704,6 +2737,14 @@ function EventsView({ currentUser, onOpenProfile }) {
               >
                 Escolher no Maps
               </a>
+              <button
+                type="button"
+                onClick={() => openMapModal('Preview do local', eventMapQuery)}
+                disabled={!eventMapQuery}
+                className={`text-xs px-2 py-1 rounded-md ${eventMapQuery ? 'bg-violet-600 text-white hover:bg-violet-700' : 'bg-zinc-900 text-zinc-600 cursor-not-allowed'}`}
+              >
+                Abrir no app
+              </button>
             </div>
             {eventMapEmbedUrl && (
               <iframe
@@ -2787,9 +2828,18 @@ function EventsView({ currentUser, onOpenProfile }) {
                 </button>
                 <div className="flex flex-wrap gap-2">
                   {(item.venue || item.city) && (
-                    <a href={buildGoogleMapsSearchUrl(`${item.venue || ''}, ${item.city || ''}`)} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">
-                      Maps
-                    </a>
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => openMapModal(item.title || 'Local do evento', `${item.venue || ''}, ${item.city || ''}`)}
+                        className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100"
+                      >
+                        Maps
+                      </button>
+                      <a href={buildGoogleMapsSearchUrl(`${item.venue || ''}, ${item.city || ''}`)} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-zinc-200">
+                        Abrir
+                      </a>
+                    </>
                   )}
                   {item.ticket_url && <a href={item.ticket_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm font-semibold px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white"><Ticket className="w-4 h-4" />Ingressos</a>}
                   {item.contact_url && <a href={item.contact_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100">Contato</a>}
@@ -2799,6 +2849,12 @@ function EventsView({ currentUser, onOpenProfile }) {
           </div>
         ))}
       </div>
+      <MapsModal
+        isOpen={mapModal.open}
+        title={mapModal.title}
+        query={mapModal.query}
+        onClose={() => setMapModal({ open: false, title: '', query: '' })}
+      />
     </div>
   );
 }
@@ -4263,6 +4319,36 @@ function ProfileView({ user, setUser, viewerUser }) {
         )}
 
         {renderActiveTabContent()}
+      </div>
+    </div>
+  );
+}
+
+function MapsModal({ isOpen, title, query, onClose }) {
+  if (!isOpen) return null;
+  const mapQuery = String(query || '').trim();
+  if (!mapQuery) return null;
+  const embedUrl = `https://www.google.com/maps?q=${encodeURIComponent(mapQuery)}&output=embed`;
+  const externalUrl = buildGoogleMapsSearchUrl(mapQuery);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-end md:items-center justify-center p-3 md:p-6">
+      <div className="w-full max-w-3xl bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden shadow-2xl">
+        <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-white truncate">{title || 'Mapa'}</p>
+            <p className="text-xs text-zinc-500 truncate">{mapQuery}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <a href={externalUrl} target="_blank" rel="noreferrer" className="text-xs px-2.5 py-1.5 rounded-md bg-zinc-800 text-zinc-200 hover:bg-zinc-700">
+              Abrir no Maps
+            </a>
+            <button type="button" onClick={onClose} className="p-2 rounded-md text-zinc-300 hover:text-white hover:bg-zinc-800" title="Fechar mapa">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+        <iframe src={embedUrl} title={title || 'Mapa'} className="w-full h-[52vh] md:h-[68vh] border-0" loading="lazy" />
       </div>
     </div>
   );
