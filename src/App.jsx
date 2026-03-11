@@ -2434,8 +2434,7 @@ function ShoppingView({ currentUser, onOpenProfile }) {
       buildBlockedUserIdSet(currentUser.id),
       supabase
         .from('marketplace_listings')
-        .select('*, profiles!marketplace_listings_seller_id_fkey(id, name, handle, avatar_url)')
-        .eq('is_active', true)
+        .select('*')
         .order('created_at', { ascending: false }),
       supabase
         .from('marketplace_favorites')
@@ -2444,13 +2443,34 @@ function ShoppingView({ currentUser, onOpenProfile }) {
     ]);
 
     if (listingsResult.error) {
-      setErrorMessage('Nao foi possivel carregar Shopping. Verifique a tabela marketplace_listings no banco.');
+      setErrorMessage(`Nao foi possivel carregar Shopping (${listingsResult.error.message || 'erro desconhecido'}).`);
       setListings([]);
       setLoading(false);
       return;
     }
 
-    const visibleListings = (listingsResult.data || []).filter((item) => !blockedUsers.has(normalizeId(item.seller_id)));
+    const baseListings = (listingsResult.data || []).filter((item) => item.is_active !== false);
+    const sellerIds = Array.from(new Set(baseListings.map((item) => normalizeId(item.seller_id)).filter(Boolean)));
+
+    const profilesById = {};
+    if (sellerIds.length) {
+      const { data: profilesData } = await supabase
+        .from('profiles')
+        .select('id, name, handle, avatar_url')
+        .in('id', sellerIds);
+
+      (profilesData || []).forEach((profile) => {
+        profilesById[normalizeId(profile.id)] = profile;
+      });
+    }
+
+    const visibleListings = baseListings
+      .map((item) => ({
+        ...item,
+        profiles: profilesById[normalizeId(item.seller_id)] || null
+      }))
+      .filter((item) => !blockedUsers.has(normalizeId(item.seller_id)));
+
     setListings(visibleListings);
 
     if (!favoritesResult.error) {
