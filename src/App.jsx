@@ -23,6 +23,7 @@ const ASCENSAO_LIKES_STORAGE_KEY = 'sonora_ascensao_likes';
 const USER_FOLLOWS_STORAGE_KEY = 'sonora_user_follows';
 const COMMUNITY_DEFAULT_GENRES = ['Rock', 'Pop', 'Rap', 'Eletronica', 'Gospel', 'MPB'];
 const AVAILABLE_APP_TABS = new Set(['feed', 'direct', 'communities', 'playlists', 'ascensao', 'profile']);
+const SPOTIFY_OAUTH_STATE = 'sonora_spotify_oauth';
 const APP_NAV_ITEMS = [
   { id: 'feed', label: 'Feed', icon: Home },
   { id: 'direct', label: 'Direct', icon: MessageCircle },
@@ -349,13 +350,16 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    // Capturar o token do Spotify se estiver no URL (apos o login)
+    // Capturar token do Spotify apenas quando o callback for do Spotify.
     const hash = window.location.hash;
     if (hash && hash.includes('access_token')) {
-      const token = new URLSearchParams(hash.substring(1)).get('access_token');
-      if (token) {
+      const hashParams = new URLSearchParams(hash.substring(1));
+      const token = hashParams.get('access_token');
+      const state = hashParams.get('state');
+      const tokenType = hashParams.get('token_type');
+      if (token && state === SPOTIFY_OAUTH_STATE && tokenType) {
         window.localStorage.setItem('spotify_token', token);
-        window.history.replaceState(null, null, ' '); // Limpa o URL
+        window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
       }
     }
 
@@ -2787,7 +2791,8 @@ function ProfileView({ user, setUser, viewerUser }) {
     const clientId = 'aeed4c6250654ee6b74e806422f15a3b';
     const redirectUri = encodeURIComponent(window.location.origin + '/');
     const scope = encodeURIComponent('user-top-read user-read-private');
-    window.location.href = `https://accounts.spotify.com/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=${scope}&response_type=token`;
+    const state = encodeURIComponent(SPOTIFY_OAUTH_STATE);
+    window.location.href = `https://accounts.spotify.com/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=${scope}&response_type=token&state=${state}`;
   };
 
   const handleImageUpload = async (event, field) => {
