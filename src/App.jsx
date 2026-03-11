@@ -2786,13 +2786,24 @@ function ProfileView({ user, setUser, viewerUser }) {
                 id: artist.id,
                 name: artist.name,
                 image_url: artist.images?.[0]?.url || '',
-                genres: Array.isArray(artist.genres) ? artist.genres.slice(0, 2) : []
+                genres: Array.from(
+                  new Set(
+                    (Array.isArray(artist.genres) ? artist.genres : [])
+                      .map((genre) => String(genre || '').trim())
+                      .filter(Boolean)
+                  )
+                ).slice(0, 3)
               }))
             : [];
 
           const tracks = Array.isArray(tracksData?.items) ? tracksData.items : [];
           const totalDurationMs = tracks.reduce((sum, track) => sum + Number(track?.duration_ms || 0), 0);
-          const minutes = Math.round(totalDurationMs / 60000);
+          const weightedDurationMs = tracks.reduce((sum, track, index) => {
+            const rankWeight = Math.max(1, 6 - Math.floor(index / 10));
+            return sum + Number(track?.duration_ms || 0) * rankWeight;
+          }, 0);
+          const minutesTopTracks = Math.round(totalDurationMs / 60000);
+          const minutesEstimate = Math.round(weightedDurationMs / 60000);
 
           return [
             period.id,
@@ -2800,7 +2811,8 @@ function ProfileView({ user, setUser, viewerUser }) {
               period_label: period.label,
               artists_count: topArtists.length,
               tracks_count: tracks.length,
-              minutes_estimate: minutes,
+              minutes_estimate: Math.max(minutesTopTracks, minutesEstimate),
+              minutes_top_tracks: minutesTopTracks,
               top_artists: topArtists
             }
           ];
@@ -3440,9 +3452,19 @@ function ProfileView({ user, setUser, viewerUser }) {
                     </p>
                   </div>
                   <div className="bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2">
-                    <p className="text-[11px] text-zinc-500 uppercase tracking-wide">Minutos</p>
+                    <p className="text-[11px] text-zinc-500 uppercase tracking-wide">Minutos (estimado)</p>
                     <p className="text-sm font-semibold text-white mt-1">
-                      {formatMinutes(selectedCapsulePeriodData.minutes_estimate)}
+                      {formatMinutes(
+                        selectedCapsulePeriodData.minutes_estimate
+                        || selectedCapsulePeriodData.minutes_top_tracks
+                        || (Number(selectedCapsulePeriodData.tracks_count || 0) * 3)
+                      )}
+                    </p>
+                    <p className="text-[10px] text-zinc-500 mt-1">
+                      Top faixas: {formatMinutes(
+                        selectedCapsulePeriodData.minutes_top_tracks
+                        || (Number(selectedCapsulePeriodData.tracks_count || 0) * 3)
+                      )}
                     </p>
                   </div>
                   <div className="bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2 col-span-2 md:col-span-1">
@@ -3456,24 +3478,31 @@ function ProfileView({ user, setUser, viewerUser }) {
                 <div className="space-y-2">
                   {(Array.isArray(selectedCapsulePeriodData.top_artists) ? selectedCapsulePeriodData.top_artists : [])
                     .slice(0, 5)
-                    .map((artist, index) => (
-                      <div key={artist.id || `${artist.name}-${index}`} className="flex items-center gap-3 bg-zinc-900 border border-zinc-800 rounded-xl p-2.5">
-                        <div className="w-7 h-7 rounded-full bg-zinc-800 text-zinc-300 text-xs font-bold flex items-center justify-center shrink-0">
-                          #{index + 1}
+                    .map((artist, index) => {
+                      const genresList = Array.isArray(artist?.genres)
+                        ? artist.genres.filter(Boolean)
+                        : (artist?.genre ? [artist.genre] : []);
+                      const artistImage = artist?.image_url || artist?.images?.[0]?.url || '';
+
+                      return (
+                        <div key={artist.id || `${artist.name}-${index}`} className="flex items-center gap-3 bg-zinc-900 border border-zinc-800 rounded-xl p-2.5">
+                          <div className="w-7 h-7 rounded-full bg-zinc-800 text-zinc-300 text-xs font-bold flex items-center justify-center shrink-0">
+                            #{index + 1}
+                          </div>
+                          {artistImage ? (
+                            <img src={artistImage} className="w-9 h-9 rounded-full object-cover bg-zinc-800" />
+                          ) : (
+                            <div className="w-9 h-9 rounded-full bg-zinc-800" />
+                          )}
+                          <div className="min-w-0">
+                            <p className="text-sm font-semibold text-white truncate">{artist.name || 'Artista'}</p>
+                            <p className="text-xs text-zinc-500 truncate">
+                              {genresList.length ? genresList.join(' - ') : 'Genero nao informado'}
+                            </p>
+                          </div>
                         </div>
-                        {artist.image_url ? (
-                          <img src={artist.image_url} className="w-9 h-9 rounded-full object-cover bg-zinc-800" />
-                        ) : (
-                          <div className="w-9 h-9 rounded-full bg-zinc-800" />
-                        )}
-                        <div className="min-w-0">
-                          <p className="text-sm font-semibold text-white truncate">{artist.name || 'Artista'}</p>
-                          <p className="text-xs text-zinc-500 truncate">
-                            {Array.isArray(artist.genres) && artist.genres.length ? artist.genres.join(' - ') : 'Genero nao informado'}
-                          </p>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                 </div>
               </div>
             )}
