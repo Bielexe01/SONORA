@@ -3,7 +3,7 @@ import {
   Search, PlusCircle, X, Trash2, Heart, Share2, Bookmark, 
   MessageSquare, MessageCircle, Crown, Users, Hash, Music, 
   LayoutGrid, Award, Radio, PlayCircle, MoreHorizontal, 
-  Settings, Image as ImageIcon, Mic, Globe, ChevronDown, 
+  Settings, Edit3, Image as ImageIcon, Mic, Globe, ChevronDown, 
   Disc, Headphones, Play, Pause
 } from 'lucide-react';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.3/+esm';
@@ -186,6 +186,23 @@ const updateLocalCommunityPosts = (communityId, updater) => {
   return nextPosts;
 };
 
+const createCommunityInviteNotification = async ({ recipientId, actorId, communityId, communityName }) => {
+  const recipient = String(recipientId || '');
+  const actor = String(actorId || '');
+  if (!recipient || !actor || recipient === actor) return;
+
+  await supabase.from('notifications').insert([{
+    recipient_id: recipient,
+    actor_id: actor,
+    type: 'community_invite',
+    title: `${communityName || 'Comunidade'} liberou seu acesso`,
+    body: 'Sua solicitacao foi aprovada. Toque para entrar na comunidade.',
+    entity_type: 'community',
+    entity_id: String(communityId || ''),
+    metadata: { community_id: String(communityId || '') }
+  }]);
+};
+
 const normalizeCommunityPost = (post) => {
   const content = post.content || '';
   const pollVotes = post.poll_votes && typeof post.poll_votes === 'object' ? post.poll_votes : {};
@@ -280,6 +297,15 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
   const [postReactions, setPostReactions] = useState({});
   const [copiedPostId, setCopiedPostId] = useState('');
   const [highlightedPostId, setHighlightedPostId] = useState('');
+  const [editingPostId, setEditingPostId] = useState('');
+  const [editingPostDraft, setEditingPostDraft] = useState({
+    title: '',
+    content: '',
+    spotify_url: '',
+    image_url: ''
+  });
+  const [savingEditPostId, setSavingEditPostId] = useState('');
+  const [deletingPostId, setDeletingPostId] = useState('');
   const [pollDraft, setPollDraft] = useState(['', '', '', '']);
   const [challengeUnitDraft, setChallengeUnitDraft] = useState('pts');
   const [uploadingCommunityMedia, setUploadingCommunityMedia] = useState('');
@@ -681,7 +707,15 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     const community = communities.find((item) => item.id === communityId);
     if (!community || community.created_by !== currentUser.id) return;
     setJoiningId(`${communityId}-${userId}`);
-    await addMemberToCommunity(communityId, userId);
+    const approved = await addMemberToCommunity(communityId, userId);
+    if (approved) {
+      await createCommunityInviteNotification({
+        recipientId: userId,
+        actorId: currentUser.id,
+        communityId,
+        communityName: community.name
+      });
+    }
     removeJoinRequest(communityId, userId);
     setInfoMessage('Membro aprovado com sucesso.');
     setJoiningId(null);
@@ -817,7 +851,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
 
     try {
       const ext = (file.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
-      const storagePath = `communities/${selectedCommunity.id}/${field}-${Date.now()}.${ext}`;
+      const storagePath = `${currentUser.id}/communities/${selectedCommunity.id}/${field}-${Date.now()}.${ext}`;
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('media')
         .upload(storagePath, file, { upsert: true });
@@ -916,7 +950,7 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     if (composerImageFile) {
       try {
         const ext = (composerImageFile.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
-        const filePath = `community-posts/${selectedCommunityId}/${currentUser.id}-${Date.now()}.${ext}`;
+        const filePath = `${currentUser.id}/community-posts/${selectedCommunityId}/${Date.now()}.${ext}`;
         const { data: uploadData, error: uploadError } = await supabase.storage
           .from('media')
           .upload(filePath, composerImageFile, { upsert: true });
@@ -1022,6 +1056,115 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
     setShowImageUrlInput(false);
     clearComposerImage();
     setIsPublishingPost(false);
+  };
+
+  const openPostEditor = (post) => {
+    if (!post) return;
+    setEditingPostId(String(post.id));
+    setEditingPostDraft({
+      title: String(post.title || ''),
+      content: String(post.content || ''),
+      spotify_url: String(post.spotify_url || ''),
+      image_url: String(post.image_url || '')
+    });
+  };
+
+  const closePostEditor = () => {
+    setEditingPostId('');
+    setEditingPostDraft({
+      title: '',
+      content: '',
+      spotify_url: '',
+      image_url: ''
+    });
+  };
+
+  const handleSavePostEdit = async (post) => {
+    if (!post || !selectedCommunityId) return;
+
+    const canManagePost = post.user_id === currentUser.id || selectedCommunity?.created_by === currentUser.id;
+    if (!canManagePost) return;
+
+    const spotifyInput = editingPostDraft.spotify_url.trim();
+    const parsedSpotify = spotifyInput ? parseSpotifyLink(spotifyInput) : null;
+    if (spotifyInput && !parsedSpotify) {
+      setErrorMessage('O link do Spotify e invalido.');
+      return;
+    }
+
+    const payload = {
+      title: editingPostDraft.title.trim() || '',
+      content: editingPostDraft.content.trim(),
+      spotify_url: parsedSpotify?.canonicalUrl || null,
+      image_url: editingPostDraft.image_url.trim() || null
+    };
+
+    setSavingEditPostId(String(post.id));
+    persistPosts(
+      selectedCommunityId,
+      communityPosts.map((current) => (
+        String(current.id) === String(post.id)
+          ? normalizeCommunityPost({ ...current, ...payload })
+          : current
+      ))
+    );
+
+    if (postsBackend === 'remote' && !String(post.id).startsWith('local-')) {
+      let query = supabase
+        .from('community_posts')
+        .update(payload)
+        .eq('id', post.id)
+        .eq('community_id', selectedCommunityId);
+
+      if (selectedCommunity?.created_by !== currentUser.id) {
+        query = query.eq('user_id', currentUser.id);
+      }
+
+      const { error } = await query;
+      if (error) {
+        setErrorMessage('Nao foi possivel editar este post.');
+        await fetchCommunityPosts(selectedCommunityId);
+      }
+    }
+
+    setSavingEditPostId('');
+    closePostEditor();
+  };
+
+  const handleDeletePost = async (post) => {
+    if (!post || !selectedCommunityId) return;
+
+    const canManagePost = post.user_id === currentUser.id || selectedCommunity?.created_by === currentUser.id;
+    if (!canManagePost) return;
+    if (!window.confirm('Deseja remover este post da comunidade?')) return;
+
+    setDeletingPostId(String(post.id));
+    const previousPosts = [...communityPosts];
+    persistPosts(
+      selectedCommunityId,
+      communityPosts.filter((current) => String(current.id) !== String(post.id))
+    );
+
+    if (postsBackend === 'remote' && !String(post.id).startsWith('local-')) {
+      let query = supabase
+        .from('community_posts')
+        .delete()
+        .eq('id', post.id)
+        .eq('community_id', selectedCommunityId);
+
+      if (selectedCommunity?.created_by !== currentUser.id) {
+        query = query.eq('user_id', currentUser.id);
+      }
+
+      const { error } = await query;
+      if (error) {
+        setErrorMessage('Nao foi possivel remover este post.');
+        persistPosts(selectedCommunityId, previousPosts);
+      }
+    }
+
+    setDeletingPostId('');
+    if (editingPostId === String(post.id)) closePostEditor();
   };
 
   const updatePostById = async (postId, updater) => {
@@ -1930,6 +2073,8 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                       const hasSharedPost = hasUserReaction(post.id, 'shares');
                       const isCopiedPostLink = copiedPostId === postIdKey;
                       const isHighlightedPost = highlightedPostId === postIdKey;
+                      const isEditingPost = editingPostId === postIdKey;
+                      const canManagePost = post.user_id === currentUser.id || selectedCommunity?.created_by === currentUser.id;
                       
                       return (
                         <div
@@ -1965,14 +2110,86 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                                 </div>
                               </div>
                             </button>
-                            <button className="text-slate-400 hover:text-slate-200 p-1 rounded-full hover:bg-slate-800 transition-colors">
-                              <MoreHorizontal className="w-5 h-5" />
-                            </button>
+                            {canManagePost ? (
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => (isEditingPost ? closePostEditor() : openPostEditor(post))}
+                                  className="text-slate-400 hover:text-violet-300 p-1 rounded-full hover:bg-slate-800 transition-colors"
+                                  title={isEditingPost ? 'Cancelar edicao' : 'Editar post'}
+                                >
+                                  {isEditingPost ? <X className="w-5 h-5" /> : <Edit3 className="w-5 h-5" />}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeletePost(post)}
+                                  disabled={deletingPostId === postIdKey}
+                                  className="text-slate-400 hover:text-rose-400 p-1 rounded-full hover:bg-slate-800 transition-colors disabled:opacity-50"
+                                  title="Excluir post"
+                                >
+                                  <Trash2 className="w-5 h-5" />
+                                </button>
+                              </div>
+                            ) : (
+                              <button className="text-slate-400 hover:text-slate-200 p-1 rounded-full hover:bg-slate-800 transition-colors">
+                                <MoreHorizontal className="w-5 h-5" />
+                              </button>
+                            )}
                           </div>
 
-                          {post.title && <h4 className="text-lg font-bold text-white mb-2 leading-tight">{post.title}</h4>}
+                          {isEditingPost && (
+                            <div className="mb-4 rounded-xl border border-violet-500/40 bg-slate-950/60 p-3 space-y-2">
+                              <input
+                                type="text"
+                                value={editingPostDraft.title}
+                                onChange={(event) => setEditingPostDraft((prev) => ({ ...prev, title: event.target.value }))}
+                                placeholder="Titulo do post"
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-500"
+                              />
+                              <textarea
+                                value={editingPostDraft.content}
+                                onChange={(event) => setEditingPostDraft((prev) => ({ ...prev, content: event.target.value }))}
+                                placeholder="Conteudo"
+                                rows={4}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-500 resize-none"
+                              />
+                              <input
+                                type="text"
+                                value={editingPostDraft.spotify_url}
+                                onChange={(event) => setEditingPostDraft((prev) => ({ ...prev, spotify_url: event.target.value }))}
+                                placeholder="Link do Spotify (opcional)"
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-500"
+                              />
+                              <input
+                                type="text"
+                                value={editingPostDraft.image_url}
+                                onChange={(event) => setEditingPostDraft((prev) => ({ ...prev, image_url: event.target.value }))}
+                                placeholder="URL da imagem (opcional)"
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-500"
+                              />
+                              <div className="flex items-center justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={closePostEditor}
+                                  className="px-3 py-1.5 text-sm rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200"
+                                >
+                                  Cancelar
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleSavePostEdit(post)}
+                                  disabled={savingEditPostId === postIdKey}
+                                  className="px-3 py-1.5 text-sm rounded-lg bg-violet-600 hover:bg-violet-500 text-white disabled:opacity-50"
+                                >
+                                  {savingEditPostId === postIdKey ? 'Salvando...' : 'Salvar alteracoes'}
+                                </button>
+                              </div>
+                            </div>
+                          )}
 
-                          {post.content && (
+                          {!isEditingPost && post.title && <h4 className="text-lg font-bold text-white mb-2 leading-tight">{post.title}</h4>}
+
+                          {!isEditingPost && post.content && (
                             <p className="text-slate-300 text-[15px] leading-relaxed mb-4 whitespace-pre-wrap">
                               {post.content}
                             </p>
@@ -2066,7 +2283,8 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                           )}
 
                           {/* Media attachments */}
-                          <div className="space-y-3 mb-2">
+                          {!isEditingPost && (
+                            <div className="space-y-3 mb-2">
                             {postSpotify && (
                               <div className="rounded-xl overflow-hidden bg-black/40 border border-slate-800/50">
                                 <iframe
@@ -2093,7 +2311,8 @@ export default function CommunitiesHub({ currentUser, onOpenDirect, onOpenProfil
                                 className="w-full max-h-[400px] object-cover rounded-xl border border-slate-800/50"
                               />
                             )}
-                          </div>
+                            </div>
+                          )}
 
                           {/* Footer Actions */}
                           <div className="flex items-center gap-6 mt-5 pt-4 border-t border-slate-800/60 text-slate-400">
