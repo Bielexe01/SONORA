@@ -5,7 +5,7 @@ import {
   Check, X, Search, PlusCircle, Headphones, Star, Award, 
   LogOut, Image as ImageIcon, Link as LinkIcon, Trash2, Send, Camera, Chrome,
   Mail, Lock, Eye, EyeOff, Github, ChevronRight, Disc,
-  ShoppingBag, CalendarDays, MapPin, Ticket
+  ShoppingBag, CalendarDays, MapPin, Ticket, Flag, UserX, Bell
 } from 'lucide-react';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.3/+esm';
 import { motion, useMotionValue, useSpring } from 'framer-motion';
@@ -23,7 +23,7 @@ const ASCENSAO_POSTS_STORAGE_KEY = 'sonora_ascensao_posts';
 const ASCENSAO_LIKES_STORAGE_KEY = 'sonora_ascensao_likes';
 const USER_FOLLOWS_STORAGE_KEY = 'sonora_user_follows';
 const COMMUNITY_DEFAULT_GENRES = ['Rock', 'Pop', 'Rap', 'Eletronica', 'Gospel', 'MPB'];
-const AVAILABLE_APP_TABS = new Set(['feed', 'direct', 'communities', 'playlists', 'shopping', 'events', 'ascensao', 'profile']);
+const AVAILABLE_APP_TABS = new Set(['feed', 'direct', 'communities', 'playlists', 'shopping', 'events', 'notifications', 'ascensao', 'profile']);
 const SPOTIFY_CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID || '';
 const SPOTIFY_TOKEN_STORAGE_KEY = 'spotify_token';
 const SPOTIFY_AUTH_DATA_STORAGE_KEY = 'sonora_spotify_auth_data';
@@ -36,6 +36,7 @@ const APP_NAV_ITEMS = [
   { id: 'playlists', label: 'Playlists', icon: ListMusic },
   { id: 'shopping', label: 'Shopping', icon: ShoppingBag },
   { id: 'events', label: 'Eventos', icon: CalendarDays },
+  { id: 'notifications', label: 'Notificacoes', icon: Bell },
   { id: 'ascensao', label: 'Ascensao', icon: TrendingUp },
   { id: 'profile', label: 'Perfil', icon: User }
 ];
@@ -309,6 +310,143 @@ const buildGoogleMapsSearchUrl = (rawAddress) => {
 };
 
 const getSpotifyEmbedHeight = (type) => (type === 'track' || type === 'episode' ? 152 : 352);
+
+const normalizeId = (value) => String(value || '');
+
+const buildBlockedUserIdSet = async (blockerId) => {
+  if (!blockerId) return new Set();
+  const { data, error } = await supabase
+    .from('user_blocks')
+    .select('blocked_id')
+    .eq('blocker_id', blockerId);
+  if (error) return new Set();
+  return new Set((data || []).map((row) => normalizeId(row.blocked_id)).filter(Boolean));
+};
+
+const askModerationReason = (targetLabel) => {
+  const reason = window.prompt(`Motivo da denuncia (${targetLabel}):`);
+  const normalizedReason = String(reason || '').trim();
+  if (!normalizedReason) return null;
+  const details = window.prompt('Detalhes (opcional):');
+  return {
+    reason: normalizedReason.slice(0, 280),
+    details: String(details || '').trim().slice(0, 2000) || null
+  };
+};
+
+const submitModerationReport = async ({
+  reporterId,
+  reportedUserId = null,
+  targetType,
+  targetPostId = null,
+  targetProfileId = null,
+  targetListingId = null,
+  reason,
+  details = null
+}) => {
+  if (!reporterId || !targetType || !reason) {
+    return { ok: false, message: 'Dados da denuncia incompletos.' };
+  }
+
+  const payload = {
+    reporter_id: reporterId,
+    reported_user_id: reportedUserId || null,
+    target_type: targetType,
+    target_post_id: targetPostId,
+    target_profile_id: targetProfileId,
+    target_listing_id: targetListingId,
+    reason,
+    details
+  };
+
+  const { error } = await supabase.from('moderation_reports').insert([payload]);
+  if (!error) return { ok: true };
+
+  if (error.code === '23505') {
+    return { ok: false, message: 'Voce ja denunciou este conteudo.' };
+  }
+  return { ok: false, message: 'Nao foi possivel enviar a denuncia.' };
+};
+
+const blockUser = async ({ blockerId, blockedId }) => {
+  if (!blockerId || !blockedId) return { ok: false, message: 'Usuario invalido.' };
+  if (normalizeId(blockerId) === normalizeId(blockedId)) {
+    return { ok: false, message: 'Nao e possivel bloquear seu proprio perfil.' };
+  }
+
+  const { error } = await supabase.from('user_blocks').insert([{ blocker_id: blockerId, blocked_id: blockedId }]);
+  if (!error || error.code === '23505') {
+    return { ok: true };
+  }
+
+  return { ok: false, message: 'Nao foi possivel bloquear este usuario.' };
+};
+
+const unblockUser = async ({ blockerId, blockedId }) => {
+  if (!blockerId || !blockedId) return { ok: false, message: 'Usuario invalido.' };
+
+  const { error } = await supabase
+    .from('user_blocks')
+    .delete()
+    .eq('blocker_id', blockerId)
+    .eq('blocked_id', blockedId);
+
+  if (!error) return { ok: true };
+  return { ok: false, message: 'Nao foi possivel desbloquear este usuario.' };
+};
+
+const createNotification = async ({
+  recipientId,
+  actorId,
+  type,
+  title,
+  body = null,
+  entityType = null,
+  entityId = null,
+  metadata = {}
+}) => {
+  const recipient = normalizeId(recipientId);
+  const actor = normalizeId(actorId);
+  if (!recipient || !actor || !type || !title) return;
+  if (recipient === actor) return;
+
+  await supabase.from('notifications').insert([{
+    recipient_id: recipient,
+    actor_id: actor,
+    type,
+    title: String(title).slice(0, 180),
+    body: body ? String(body).slice(0, 1000) : null,
+    entity_type: entityType || null,
+    entity_id: entityId ? String(entityId) : null,
+    metadata: metadata && typeof metadata === 'object' ? metadata : {}
+  }]);
+};
+
+const createNotificationsBulk = async (entries) => {
+  if (!Array.isArray(entries) || entries.length === 0) return;
+
+  const payload = entries
+    .map((entry) => {
+      const recipient = normalizeId(entry?.recipientId);
+      const actor = normalizeId(entry?.actorId);
+      if (!recipient || !actor || recipient === actor || !entry?.type || !entry?.title) return null;
+
+      return {
+        recipient_id: recipient,
+        actor_id: actor,
+        type: entry.type,
+        title: String(entry.title).slice(0, 180),
+        body: entry.body ? String(entry.body).slice(0, 1000) : null,
+        entity_type: entry.entityType || null,
+        entity_id: entry.entityId ? String(entry.entityId) : null,
+        metadata: entry.metadata && typeof entry.metadata === 'object' ? entry.metadata : {}
+      };
+    })
+    .filter(Boolean);
+
+  if (!payload.length) return;
+  await supabase.from('notifications').insert(payload);
+};
 
 const getLocalCommunityMembershipState = (userId) => {
   try {
@@ -721,16 +859,17 @@ export default function App() {
           {activeTab === 'playlists' && <PlaylistsView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'shopping' && <ShoppingView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'events' && <EventsView currentUser={currentUser} onOpenProfile={openProfile} />}
+          {activeTab === 'notifications' && <NotificationsView currentUser={currentUser} onOpenProfile={openProfile} onNavigate={handleTabChange} />}
           {activeTab === 'ascensao' && <AscensaoView currentUser={currentUser} onOpenProfile={openProfile} />}
           {activeTab === 'profile' && (
             <ProfileView
               user={selectedProfile || currentUser}
               viewerUser={currentUser}
+              onOpenProfile={openProfile}
               setUser={(nextUser) => {
                 setCurrentUser(nextUser);
                 if (selectedProfile && String(selectedProfile.id) === String(nextUser.id)) setSelectedProfile(nextUser);
               }}
-              onOpenProfile={openProfile}
             />
           )}
         </div>
@@ -1095,11 +1234,16 @@ function FeedView({ currentUser, onOpenProfile }) {
   }, []);
 
   const fetchPosts = async () => {
+    const blockedUsers = await buildBlockedUserIdSet(currentUser.id);
     const { data } = await supabase
       .from('posts')
       .select('*, profiles!posts_user_id_fkey(id, name, handle, avatar_url)')
       .order('created_at', { ascending: false });
-    if (data) setPosts(data);
+    if (data) {
+      setPosts(
+        data.filter((post) => !blockedUsers.has(normalizeId(post.user_id)))
+      );
+    }
   };
 
   const handleImageChange = (e) => {
@@ -1228,7 +1372,15 @@ function FeedView({ currentUser, onOpenProfile }) {
       </div>
 
       <div className="space-y-6">
-        {posts.map(post => <PostCard key={post.id} post={post} currentUser={currentUser} fetchPosts={fetchPosts} onOpenProfile={onOpenProfile} />)}
+        {posts.map((post) => (
+          <PostCard
+            key={post.id}
+            post={post}
+            currentUser={currentUser}
+            fetchPosts={fetchPosts}
+            onOpenProfile={onOpenProfile}
+          />
+        ))}
       </div>
     </div>
   );
@@ -1287,6 +1439,15 @@ function PostCard({ post, currentUser, fetchPosts, onOpenProfile }) {
       if (!error) {
         setLiked(true);
         setLikesCount((prev) => prev + 1);
+        await createNotification({
+          recipientId: post.user_id,
+          actorId: currentUser.id,
+          type: 'like',
+          title: `${currentUser.name || 'Alguem'} curtiu seu post`,
+          body: post.content ? String(post.content).slice(0, 120) : null,
+          entityType: 'post',
+          entityId: post.id
+        });
       }
     }
 
@@ -1310,7 +1471,21 @@ function PostCard({ post, currentUser, fetchPosts, onOpenProfile }) {
   const handlePostComment = async (e) => {
     e.preventDefault();
     if (!newComment.trim()) return;
-    await supabase.from('comments').insert([{ post_id: post.id, user_id: currentUser.id, content: newComment }]);
+    const commentContent = newComment.trim();
+    const { error } = await supabase
+      .from('comments')
+      .insert([{ post_id: post.id, user_id: currentUser.id, content: commentContent }]);
+    if (!error) {
+      await createNotification({
+        recipientId: post.user_id,
+        actorId: currentUser.id,
+        type: 'comment',
+        title: `${currentUser.name || 'Alguem'} comentou no seu post`,
+        body: commentContent.slice(0, 160),
+        entityType: 'post',
+        entityId: post.id
+      });
+    }
     setNewComment('');
     fetchComments();
   };
@@ -1322,12 +1497,58 @@ function PostCard({ post, currentUser, fetchPosts, onOpenProfile }) {
     }
   };
 
+  const handleReportPost = async () => {
+    const reasonPayload = askModerationReason('post');
+    if (!reasonPayload) return;
+
+    const result = await submitModerationReport({
+      reporterId: currentUser.id,
+      reportedUserId: post.user_id || null,
+      targetType: 'post',
+      targetPostId: post.id,
+      reason: reasonPayload.reason,
+      details: reasonPayload.details
+    });
+
+    alert(result.ok ? 'Denuncia enviada.' : result.message);
+  };
+
+  const handleBlockAuthor = async () => {
+    const authorName = profile?.name || 'este usuario';
+    if (!window.confirm(`Bloquear ${authorName}? Os posts dele nao aparecerao mais para voce.`)) return;
+    const result = await blockUser({ blockerId: currentUser.id, blockedId: post.user_id });
+    if (!result.ok) {
+      alert(result.message);
+      return;
+    }
+    await fetchPosts();
+    alert('Usuario bloqueado com sucesso.');
+  };
+
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 md:p-5 relative group">
       {isOwner && (
         <button onClick={handleDelete} className="absolute top-4 right-4 text-zinc-600 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity">
           <Trash2 className="w-4 h-4" />
         </button>
+      )}
+      {!isOwner && (
+        <div className="absolute top-4 right-4 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            onClick={handleReportPost}
+            className="text-zinc-500 hover:text-amber-300 p-1 rounded-md hover:bg-zinc-800"
+            title="Denunciar post"
+          >
+            <Flag className="w-4 h-4" />
+          </button>
+          <button
+            onClick={handleBlockAuthor}
+            className="text-zinc-500 hover:text-red-400 p-1 rounded-md hover:bg-zinc-800"
+            title="Bloquear usuario"
+          >
+            <UserX className="w-4 h-4" />
+          </button>
+        </div>
       )}
       <div className="flex items-center mb-4">
         <button
@@ -1410,6 +1631,7 @@ function DirectView({ currentUser, onOpenProfile }) {
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [sendingMessage, setSendingMessage] = useState(false);
   const [conversationMeta, setConversationMeta] = useState({});
+  const [blockedUserIds, setBlockedUserIds] = useState(() => new Set());
   const messagesEndRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -1428,17 +1650,25 @@ function DirectView({ currentUser, onOpenProfile }) {
 
   const fetchUsers = async () => {
     setLoadingUsers(true);
+    const blockedUsers = await buildBlockedUserIdSet(currentUser.id);
+    setBlockedUserIds(blockedUsers);
+
     const { data, error } = await supabase
       .from('profiles')
       .select('id, name, handle, avatar_url')
       .neq('id', currentUser.id)
       .order('name', { ascending: true });
 
-    if (!error) setUsers(data || []);
+    if (!error) {
+      setUsers(
+        (data || []).filter((profile) => !blockedUsers.has(normalizeId(profile.id)))
+      );
+    }
     setLoadingUsers(false);
   };
 
   const fetchConversationMeta = async () => {
+    const blockedUsers = await buildBlockedUserIdSet(currentUser.id);
     const { data, error } = await supabase
       .from('messages')
       .select('id, sender_id, receiver_id, content, created_at')
@@ -1450,6 +1680,7 @@ function DirectView({ currentUser, onOpenProfile }) {
     const nextMeta = {};
     (data || []).forEach((message) => {
       const otherUserId = message.sender_id === currentUser.id ? message.receiver_id : message.sender_id;
+      if (blockedUsers.has(normalizeId(otherUserId))) return;
       if (!otherUserId || nextMeta[otherUserId]) return;
       nextMeta[otherUserId] = {
         lastMessage: message.content,
@@ -1464,6 +1695,12 @@ function DirectView({ currentUser, onOpenProfile }) {
     fetchUsers();
     fetchConversationMeta();
   }, [currentUser.id]);
+
+  useEffect(() => {
+    if (!activeUser?.id) return;
+    if (!blockedUserIds.has(normalizeId(activeUser.id))) return;
+    setActiveUser(null);
+  }, [activeUser?.id, blockedUserIds]);
 
   useEffect(() => {
     if (!activeUser) {
@@ -1532,6 +1769,15 @@ function DirectView({ currentUser, onOpenProfile }) {
           createdAt: data.created_at
         }
       }));
+      await createNotification({
+        recipientId: activeUser.id,
+        actorId: currentUser.id,
+        type: 'message',
+        title: `${currentUser.name || 'Alguem'} enviou uma mensagem`,
+        body: data.content ? String(data.content).slice(0, 160) : null,
+        entityType: 'message',
+        entityId: data.id
+      });
       scrollToBottom();
     }
 
@@ -2114,7 +2360,23 @@ function ShoppingView({ currentUser, onOpenProfile }) {
   const [showCreate, setShowCreate] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('');
+  const [cityFilter, setCityFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [minPriceFilter, setMinPriceFilter] = useState('');
+  const [maxPriceFilter, setMaxPriceFilter] = useState('');
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [deletingId, setDeletingId] = useState(null);
+  const [updatingStatusId, setUpdatingStatusId] = useState(null);
+  const [favoriteIds, setFavoriteIds] = useState(() => new Set());
+  const [favoriteCountMap, setFavoriteCountMap] = useState({});
+  const [favoriteBusyId, setFavoriteBusyId] = useState(null);
+  const [activeChatListingId, setActiveChatListingId] = useState(null);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatMessage, setChatMessage] = useState('');
+  const [chatRecipientId, setChatRecipientId] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatSending, setChatSending] = useState(false);
   const [mapModal, setMapModal] = useState({ open: false, title: '', query: '' });
   const [newItem, setNewItem] = useState({
     title: '',
@@ -2131,29 +2393,89 @@ function ShoppingView({ currentUser, onOpenProfile }) {
   const [imageFile, setImageFile] = useState(null);
   const [imagePreview, setImagePreview] = useState('');
   const imageInputRef = useRef(null);
+  const chatEndRef = useRef(null);
 
   useEffect(() => {
     fetchListings();
   }, []);
 
+  useEffect(() => {
+    if (!chatMessages.length) return;
+    setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 60);
+  }, [chatMessages, activeChatListingId]);
+
+  useEffect(() => {
+    if (!activeChatListingId) return undefined;
+    const channel = supabase
+      .channel(`shopping-chat-${currentUser.id}-${activeChatListingId}`)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'marketplace_chat_messages' }, (payload) => {
+        const message = payload.new;
+        if (!message) return;
+        if (normalizeId(message.listing_id) !== normalizeId(activeChatListingId)) return;
+        const isRelevant = normalizeId(message.sender_id) === normalizeId(currentUser.id)
+          || normalizeId(message.receiver_id) === normalizeId(currentUser.id);
+        if (!isRelevant) return;
+        setChatMessages((prev) => (prev.some((item) => item.id === message.id) ? prev : [...prev, message]));
+        if (normalizeId(message.sender_id) !== normalizeId(currentUser.id)) {
+          setChatRecipientId(message.sender_id);
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [currentUser.id, activeChatListingId, listings]);
+
   const fetchListings = async () => {
     setLoading(true);
     setErrorMessage('');
+    const [blockedUsers, listingsResult, favoritesResult] = await Promise.all([
+      buildBlockedUserIdSet(currentUser.id),
+      supabase
+        .from('marketplace_listings')
+        .select('*, profiles!marketplace_listings_seller_id_fkey(id, name, handle, avatar_url)')
+        .eq('is_active', true)
+        .order('created_at', { ascending: false }),
+      supabase
+        .from('marketplace_favorites')
+        .select('listing_id')
+        .eq('user_id', currentUser.id)
+    ]);
 
-    const { data, error } = await supabase
-      .from('marketplace_listings')
-      .select('*, profiles!marketplace_listings_seller_id_fkey(id, name, handle, avatar_url)')
-      .eq('is_active', true)
-      .order('created_at', { ascending: false });
-
-    if (error) {
+    if (listingsResult.error) {
       setErrorMessage('Nao foi possivel carregar Shopping. Verifique a tabela marketplace_listings no banco.');
       setListings([]);
       setLoading(false);
       return;
     }
 
-    setListings(data || []);
+    const visibleListings = (listingsResult.data || []).filter((item) => !blockedUsers.has(normalizeId(item.seller_id)));
+    setListings(visibleListings);
+
+    if (!favoritesResult.error) {
+      setFavoriteIds(new Set((favoritesResult.data || []).map((row) => normalizeId(row.listing_id))));
+    } else {
+      setFavoriteIds(new Set());
+    }
+
+    const listingIds = visibleListings.map((item) => item.id).filter((id) => id !== null && id !== undefined);
+    if (listingIds.length) {
+      const { data: allFavorites } = await supabase
+        .from('marketplace_favorites')
+        .select('listing_id')
+        .in('listing_id', listingIds);
+
+      const counts = {};
+      (allFavorites || []).forEach((row) => {
+        const key = normalizeId(row.listing_id);
+        counts[key] = (counts[key] || 0) + 1;
+      });
+      setFavoriteCountMap(counts);
+    } else {
+      setFavoriteCountMap({});
+    }
+
     setLoading(false);
   };
 
@@ -2170,6 +2492,11 @@ function ShoppingView({ currentUser, onOpenProfile }) {
     clearSelectedImage();
     setImageFile(file);
     setImagePreview(URL.createObjectURL(file));
+  };
+
+  const parseNumberFilter = (rawValue) => {
+    const normalized = Number(String(rawValue || '').replace(',', '.'));
+    return Number.isFinite(normalized) ? normalized : null;
   };
 
   const handleCreateListing = async (event) => {
@@ -2218,7 +2545,8 @@ function ShoppingView({ currentUser, onOpenProfile }) {
       image_url: imageUrl || null,
       image_position_x: imagePositionX,
       image_position_y: imagePositionY,
-      is_active: true
+      is_active: true,
+      status: 'available'
     }]);
 
     if (error) {
@@ -2254,20 +2582,248 @@ function ShoppingView({ currentUser, onOpenProfile }) {
       setDeletingId(null);
       return;
     }
+    if (normalizeId(activeChatListingId) === normalizeId(listingId)) {
+      setActiveChatListingId(null);
+      setChatMessages([]);
+      setChatMessage('');
+      setChatRecipientId('');
+      setChatLoading(false);
+      setChatSending(false);
+    }
     setDeletingId(null);
     await fetchListings();
   };
 
+  const handleToggleListingStatus = async (listing) => {
+    if (!listing || normalizeId(listing.seller_id) !== normalizeId(currentUser.id)) return;
+    const currentStatus = listing.status === 'sold' ? 'sold' : 'available';
+    const nextStatus = currentStatus === 'sold' ? 'available' : 'sold';
+
+    setUpdatingStatusId(listing.id);
+    const { error } = await supabase
+      .from('marketplace_listings')
+      .update({ status: nextStatus })
+      .eq('id', listing.id)
+      .eq('seller_id', currentUser.id);
+
+    if (error) {
+      setErrorMessage('Nao foi possivel atualizar o status do anuncio.');
+      setUpdatingStatusId(null);
+      return;
+    }
+
+    setListings((prev) => prev.map((item) => (
+      item.id === listing.id ? { ...item, status: nextStatus } : item
+    )));
+    setUpdatingStatusId(null);
+  };
+
+  const handleToggleFavorite = async (listingId) => {
+    if (favoriteBusyId === listingId) return;
+    const listingKey = normalizeId(listingId);
+    const alreadyFavorite = favoriteIds.has(listingKey);
+    setFavoriteBusyId(listingId);
+
+    const query = supabase.from('marketplace_favorites');
+    const result = alreadyFavorite
+      ? await query.delete().eq('listing_id', listingId).eq('user_id', currentUser.id)
+      : await query.insert([{ listing_id: listingId, user_id: currentUser.id }]);
+
+    const error = result.error;
+    if (error && !(error.code === '23505' && !alreadyFavorite)) {
+      setErrorMessage('Nao foi possivel atualizar favoritos.');
+      setFavoriteBusyId(null);
+      return;
+    }
+
+    setFavoriteIds((prev) => {
+      const next = new Set(prev);
+      if (alreadyFavorite) next.delete(listingKey);
+      else next.add(listingKey);
+      return next;
+    });
+
+    setFavoriteCountMap((prev) => {
+      const currentCount = Number(prev[listingKey] || 0);
+      return {
+        ...prev,
+        [listingKey]: alreadyFavorite ? Math.max(0, currentCount - 1) : currentCount + 1
+      };
+    });
+
+    setFavoriteBusyId(null);
+  };
+
+  const handleReportListing = async (listing) => {
+    const reasonPayload = askModerationReason('anuncio');
+    if (!reasonPayload) return;
+
+    const result = await submitModerationReport({
+      reporterId: currentUser.id,
+      reportedUserId: listing?.seller_id || null,
+      targetType: 'listing',
+      targetListingId: listing?.id || null,
+      reason: reasonPayload.reason,
+      details: reasonPayload.details
+    });
+
+    alert(result.ok ? 'Denuncia enviada.' : result.message);
+  };
+
+  const handleBlockSeller = async (listing) => {
+    const sellerId = listing?.seller_id;
+    if (!sellerId) return;
+    const sellerName = listing?.profiles?.name || 'este usuario';
+    if (!window.confirm(`Bloquear ${sellerName}? Os anuncios dele nao aparecerao mais para voce.`)) return;
+
+    const result = await blockUser({ blockerId: currentUser.id, blockedId: sellerId });
+    if (!result.ok) {
+      alert(result.message);
+      return;
+    }
+
+    await fetchListings();
+    alert('Usuario bloqueado com sucesso.');
+  };
+
+  const openListingChat = async (listing) => {
+    if (!listing?.id) return;
+    const listingId = listing.id;
+    const sellerId = listing.seller_id;
+    const isSeller = normalizeId(sellerId) === normalizeId(currentUser.id);
+    const isClosing = normalizeId(activeChatListingId) === normalizeId(listingId);
+    if (isClosing) {
+      setActiveChatListingId(null);
+      setChatMessages([]);
+      setChatMessage('');
+      setChatRecipientId('');
+      return;
+    }
+
+    setActiveChatListingId(listingId);
+    setChatLoading(true);
+    let query = supabase
+      .from('marketplace_chat_messages')
+      .select('*')
+      .eq('listing_id', listingId)
+      .order('created_at', { ascending: true });
+
+    if (isSeller) {
+      query = query.or(`sender_id.eq.${currentUser.id},receiver_id.eq.${currentUser.id}`);
+    } else {
+      query = query.or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${sellerId}),and(sender_id.eq.${sellerId},receiver_id.eq.${currentUser.id})`);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      setChatMessages([]);
+      setChatRecipientId('');
+      setChatLoading(false);
+      setErrorMessage('Nao foi possivel carregar chat do anuncio.');
+      return;
+    }
+
+    const nextMessages = data || [];
+    setChatMessages(nextMessages);
+    if (isSeller) {
+      const latestInbound = [...nextMessages].reverse().find((message) => normalizeId(message.sender_id) !== normalizeId(currentUser.id));
+      setChatRecipientId(latestInbound ? latestInbound.sender_id : '');
+    } else {
+      setChatRecipientId(sellerId);
+    }
+    setChatLoading(false);
+  };
+
+  const handleSendListingChatMessage = async (event, listing) => {
+    event.preventDefault();
+    if (!listing || chatSending) return;
+
+    const content = chatMessage.trim();
+    if (!content) return;
+    const defaultRecipient = normalizeId(listing.seller_id) === normalizeId(currentUser.id) ? '' : listing.seller_id;
+    const receiverId = chatRecipientId || defaultRecipient;
+    if (!receiverId) {
+      setErrorMessage('Escolha um comprador para responder no chat.');
+      return;
+    }
+
+    setChatSending(true);
+    const { data, error } = await supabase
+      .from('marketplace_chat_messages')
+      .insert([{
+        listing_id: listing.id,
+        sender_id: currentUser.id,
+        receiver_id: receiverId,
+        content
+      }])
+      .select('*')
+      .single();
+
+    if (error) {
+      setChatSending(false);
+      setErrorMessage('Nao foi possivel enviar mensagem no chat do anuncio.');
+      return;
+    }
+
+    setChatMessages((prev) => (prev.some((item) => item.id === data.id) ? prev : [...prev, data]));
+    setChatMessage('');
+    setChatSending(false);
+
+    await createNotification({
+      recipientId: receiverId,
+      actorId: currentUser.id,
+      type: 'message',
+      title: `${currentUser.name || 'Alguem'} enviou mensagem no Shopping`,
+      body: content.slice(0, 160),
+      entityType: 'message',
+      entityId: data.id,
+      metadata: {
+        marketplace_listing_id: String(listing.id),
+        marketplace_listing_title: listing.title || ''
+      }
+    });
+  };
+
+  const minPrice = parseNumberFilter(minPriceFilter);
+  const maxPrice = parseNumberFilter(maxPriceFilter);
+  const normalizedCategoryFilter = categoryFilter.trim().toLowerCase();
+  const normalizedCityFilter = cityFilter.trim().toLowerCase();
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+
   const filteredListings = listings.filter((item) => {
-    const query = searchQuery.trim().toLowerCase();
-    if (!query) return true;
-    return (
-      item.title?.toLowerCase().includes(query)
-      || item.description?.toLowerCase().includes(query)
-      || item.location?.toLowerCase().includes(query)
-      || item.category?.toLowerCase().includes(query)
-    );
+    const itemKey = normalizeId(item.id);
+    const itemPrice = Number(item.price || 0);
+    const itemStatus = item.status === 'sold' ? 'sold' : 'available';
+    const title = String(item.title || '').toLowerCase();
+    const description = String(item.description || '').toLowerCase();
+    const location = String(item.location || '').toLowerCase();
+    const category = String(item.category || '').toLowerCase();
+
+    if (normalizedQuery && !(
+      title.includes(normalizedQuery)
+      || description.includes(normalizedQuery)
+      || location.includes(normalizedQuery)
+      || category.includes(normalizedQuery)
+    )) {
+      return false;
+    }
+    if (statusFilter !== 'all' && itemStatus !== statusFilter) return false;
+    if (favoritesOnly && !favoriteIds.has(itemKey)) return false;
+    if (normalizedCategoryFilter && !category.includes(normalizedCategoryFilter)) return false;
+    if (normalizedCityFilter && !location.includes(normalizedCityFilter)) return false;
+    if (minPrice !== null && itemPrice < minPrice) return false;
+    if (maxPrice !== null && itemPrice > maxPrice) return false;
+    return true;
   });
+
+  const categoryOptions = Array.from(
+    new Set(listings.map((item) => String(item.category || '').trim()).filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b));
+
+  const cityOptions = Array.from(
+    new Set(listings.map((item) => String(item.location || '').trim()).filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b));
 
   const formatBRL = (value) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(Number(value || 0));
   const shoppingMapQuery = newItem.location.trim();
@@ -2294,11 +2850,92 @@ function ShoppingView({ currentUser, onOpenProfile }) {
       </div>
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-6">
-        <div className="relative w-full md:max-w-sm">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-          <input type="text" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Buscar instrumento..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl pl-9 pr-3 py-2 text-sm text-white focus:border-violet-500 outline-none" />
+        <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
+          <div className="relative md:col-span-2">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+            <input type="text" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Buscar instrumento..." className="w-full bg-zinc-950 border border-zinc-800 rounded-xl pl-9 pr-3 py-2 text-sm text-white focus:border-violet-500 outline-none" />
+          </div>
+          <input
+            type="text"
+            value={minPriceFilter}
+            onChange={(event) => setMinPriceFilter(event.target.value)}
+            placeholder="Preco min"
+            className="bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-sm text-white focus:border-violet-500 outline-none"
+          />
+          <input
+            type="text"
+            value={maxPriceFilter}
+            onChange={(event) => setMaxPriceFilter(event.target.value)}
+            placeholder="Preco max"
+            className="bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-sm text-white focus:border-violet-500 outline-none"
+          />
+          <select
+            value={categoryFilter}
+            onChange={(event) => setCategoryFilter(event.target.value)}
+            className="bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-sm text-white focus:border-violet-500 outline-none"
+          >
+            <option value="">Todas categorias</option>
+            {categoryOptions.map((category) => (
+              <option key={category} value={category}>{category}</option>
+            ))}
+          </select>
+          <select
+            value={cityFilter}
+            onChange={(event) => setCityFilter(event.target.value)}
+            className="bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-sm text-white focus:border-violet-500 outline-none"
+          >
+            <option value="">Todas cidades</option>
+            {cityOptions.map((city) => (
+              <option key={city} value={city}>{city}</option>
+            ))}
+          </select>
         </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <select
+            value={statusFilter}
+            onChange={(event) => setStatusFilter(event.target.value)}
+            className="bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-xs text-white focus:border-violet-500 outline-none"
+          >
+            <option value="all">Todos status</option>
+            <option value="available">Somente disponiveis</option>
+            <option value="sold">Somente vendidos</option>
+          </select>
+          <button
+            type="button"
+            onClick={() => setFavoritesOnly((prev) => !prev)}
+            className={`px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1 ${
+              favoritesOnly ? 'bg-red-600 text-white hover:bg-red-700' : 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
+            }`}
+          >
+            <Heart className={`w-3.5 h-3.5 ${favoritesOnly ? 'fill-current' : ''}`} />
+            Favoritos
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setSearchQuery('');
+              setCategoryFilter('');
+              setCityFilter('');
+              setStatusFilter('all');
+              setMinPriceFilter('');
+              setMaxPriceFilter('');
+              setFavoritesOnly(false);
+            }}
+            className="px-3 py-2 rounded-xl text-xs font-semibold bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+          >
+            Limpar filtros
+          </button>
+        </div>
+        <p className="mt-2 text-xs text-zinc-500">
+          {filteredListings.length} resultado(s) {favoritesOnly ? 'em favoritos' : 'no Shopping'}.
+        </p>
       </div>
+
+      {activeChatListingId && (
+        <div className="mb-6 bg-violet-500/10 border border-violet-500/30 text-violet-100 rounded-xl px-4 py-3 text-xs">
+          Chat do anuncio ativo. Abra o card correspondente para continuar a conversa.
+        </div>
+      )}
 
       {errorMessage && <div className="mb-6 bg-red-500/10 border border-red-500/30 text-red-300 rounded-xl px-4 py-3 text-sm">{errorMessage}</div>}
 
@@ -2401,7 +3038,7 @@ function ShoppingView({ currentUser, onOpenProfile }) {
         {loading && <p className="text-sm text-zinc-500">Carregando anuncios...</p>}
         {!loading && filteredListings.length === 0 && <p className="text-sm text-zinc-500">Nenhum anuncio encontrado.</p>}
         {!loading && filteredListings.map((item) => (
-          <div key={item.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
+          <div key={item.id} className={`bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden ${item.status === 'sold' ? 'opacity-90' : ''}`}>
             {item.image_url ? (
               <img
                 src={item.image_url}
@@ -2414,17 +3051,31 @@ function ShoppingView({ currentUser, onOpenProfile }) {
             <div className="p-4">
               <div className="flex items-start justify-between gap-3">
                 <h3 className="text-lg font-bold text-white">{item.title}</h3>
-                {item.seller_id === currentUser.id && (
-                  <button disabled={deletingId === item.id} onClick={() => handleDeleteListing(item.id)} className="text-zinc-500 hover:text-red-400 disabled:opacity-50" title="Remover anuncio">
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                )}
+                <div className="flex items-center gap-2">
+                  <span className={`text-[11px] px-2 py-1 rounded-md font-semibold ${item.status === 'sold' ? 'bg-red-500/20 text-red-200 border border-red-400/30' : 'bg-emerald-500/20 text-emerald-200 border border-emerald-400/30'}`}>
+                    {item.status === 'sold' ? 'Vendido' : 'Disponivel'}
+                  </span>
+                  {item.seller_id === currentUser.id && (
+                    <button disabled={deletingId === item.id} onClick={() => handleDeleteListing(item.id)} className="text-zinc-500 hover:text-red-400 disabled:opacity-50" title="Remover anuncio">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
               </div>
               <p className="text-violet-300 font-bold mt-1">{formatBRL(item.price)}</p>
               <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
                 <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-300">{item.condition === 'new' ? 'Novo' : 'Usado'}</span>
                 {item.category && <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-300">{item.category}</span>}
                 {item.location && <span className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-300 inline-flex items-center gap-1"><MapPin className="w-3 h-3" />{item.location}</span>}
+                <button
+                  type="button"
+                  disabled={favoriteBusyId === item.id}
+                  onClick={() => handleToggleFavorite(item.id)}
+                  className={`px-2 py-1 rounded-md inline-flex items-center gap-1 transition-colors ${favoriteIds.has(normalizeId(item.id)) ? 'bg-red-500/20 text-red-200' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'} disabled:opacity-60`}
+                >
+                  <Heart className={`w-3 h-3 ${favoriteIds.has(normalizeId(item.id)) ? 'fill-current' : ''}`} />
+                  {favoriteCountMap[normalizeId(item.id)] || 0}
+                </button>
               </div>
               {item.description && <p className="text-sm text-zinc-300 mt-3 line-clamp-3">{item.description}</p>}
               <div className="mt-4 flex items-center justify-between gap-2">
@@ -2432,6 +3083,48 @@ function ShoppingView({ currentUser, onOpenProfile }) {
                   {item.profiles?.name || 'Usuario'} {item.profiles?.handle || ''}
                 </button>
                 <div className="flex flex-wrap gap-2 justify-end">
+                  <button
+                    type="button"
+                    onClick={() => openListingChat(item)}
+                    className={`text-sm font-semibold px-3 py-1.5 rounded-lg inline-flex items-center gap-1 ${
+                      normalizeId(activeChatListingId) === normalizeId(item.id)
+                        ? 'bg-violet-600 text-white hover:bg-violet-700'
+                        : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-100'
+                    }`}
+                  >
+                    <MessageCircle className="w-4 h-4" />
+                    {normalizeId(activeChatListingId) === normalizeId(item.id) ? 'Fechar chat' : 'Chat'}
+                  </button>
+                  {item.seller_id !== currentUser.id && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleReportListing(item)}
+                        className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100 inline-flex items-center gap-1"
+                      >
+                        <Flag className="w-4 h-4" />
+                        Denunciar
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleBlockSeller(item)}
+                        className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-zinc-200 inline-flex items-center gap-1"
+                      >
+                        <UserX className="w-4 h-4" />
+                        Bloquear
+                      </button>
+                    </>
+                  )}
+                  {item.seller_id === currentUser.id && (
+                    <button
+                      type="button"
+                      disabled={updatingStatusId === item.id}
+                      onClick={() => handleToggleListingStatus(item)}
+                      className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100 disabled:opacity-60"
+                    >
+                      {item.status === 'sold' ? 'Marcar disponivel' : 'Marcar vendido'}
+                    </button>
+                  )}
                   {item.location && (
                     <>
                       <button
@@ -2446,15 +3139,70 @@ function ShoppingView({ currentUser, onOpenProfile }) {
                       </a>
                     </>
                   )}
-                  {item.purchase_url ? (
+                  {item.status !== 'sold' && item.purchase_url ? (
                     <a href={item.purchase_url} target="_blank" rel="noreferrer" className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white">
                       Comprar
                     </a>
+                  ) : item.status === 'sold' ? (
+                    <span className="text-xs text-red-300">Item vendido</span>
                   ) : (
                     <span className="text-xs text-zinc-500">Sem link de compra</span>
                   )}
                 </div>
               </div>
+
+              {normalizeId(activeChatListingId) === normalizeId(item.id) && (
+                <div className="mt-4 pt-4 border-t border-zinc-800 space-y-3">
+                  <p className="text-xs text-zinc-500">
+                    {normalizeId(item.seller_id) === normalizeId(currentUser.id)
+                      ? 'Chat do anuncio (responda o ultimo comprador).'
+                      : `Chat com ${item.profiles?.name || 'vendedor'} ${item.profiles?.handle || ''}`}
+                  </p>
+                  {normalizeId(item.seller_id) === normalizeId(currentUser.id) && chatRecipientId && (
+                    <div className="text-xs text-zinc-500">
+                      Respondendo para ID: {chatRecipientId}
+                    </div>
+                  )}
+                  {chatLoading && <p className="text-sm text-zinc-500">Carregando chat...</p>}
+                  {!chatLoading && (
+                    <div className="max-h-56 overflow-y-auto space-y-2 pr-1">
+                      {chatMessages.length === 0 && (
+                        <p className="text-sm text-zinc-500 text-center py-3">Sem mensagens ainda. Inicie o chat.</p>
+                      )}
+                      {chatMessages.map((message) => {
+                        const isMine = normalizeId(message.sender_id) === normalizeId(currentUser.id);
+                        return (
+                          <div key={message.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
+                            <div className={`max-w-[82%] px-3 py-2 rounded-2xl text-sm ${isMine ? 'bg-violet-600 text-white rounded-br-none' : 'bg-zinc-800 text-zinc-100 rounded-bl-none'}`}>
+                              <p>{message.content}</p>
+                              <p className={`text-[10px] mt-1 ${isMine ? 'text-violet-100/80' : 'text-zinc-400'}`}>
+                                {new Date(message.created_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })}
+                      <div ref={chatEndRef} />
+                    </div>
+                  )}
+                  <form onSubmit={(event) => handleSendListingChatMessage(event, item)} className="flex gap-2">
+                    <input
+                      type="text"
+                      value={chatMessage}
+                      onChange={(event) => setChatMessage(event.target.value)}
+                      placeholder="Digite sua mensagem..."
+                      className="flex-1 bg-zinc-950 border border-zinc-800 rounded-full px-4 py-2 text-sm text-white focus:border-violet-500 outline-none"
+                    />
+                    <button
+                      type="submit"
+                      disabled={chatSending || !chatMessage.trim() || (normalizeId(item.seller_id) === normalizeId(currentUser.id) && !chatRecipientId)}
+                      className="bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white p-2 w-10 h-10 rounded-full flex items-center justify-center"
+                    >
+                      <Send className="w-4 h-4" />
+                    </button>
+                  </form>
+                </div>
+              )}
             </div>
           </div>
         ))}
@@ -2505,6 +3253,7 @@ function EventsView({ currentUser, onOpenProfile }) {
   const fetchEvents = async () => {
     setLoading(true);
     setErrorMessage('');
+    const blockedUsers = await buildBlockedUserIdSet(currentUser.id);
 
     const { data, error } = await supabase
       .from('music_events')
@@ -2518,7 +3267,9 @@ function EventsView({ currentUser, onOpenProfile }) {
       return;
     }
 
-    setEvents(data || []);
+    setEvents(
+      (data || []).filter((item) => !blockedUsers.has(normalizeId(item.organizer_id)))
+    );
     setLoading(false);
   };
 
@@ -2574,7 +3325,7 @@ function EventsView({ currentUser, onOpenProfile }) {
     }
 
     setSaving(true);
-    const { error } = await supabase.from('music_events').insert([{
+    const { data: createdEvent, error } = await supabase.from('music_events').insert([{
       organizer_id: currentUser.id,
       title,
       description: description || null,
@@ -2590,13 +3341,30 @@ function EventsView({ currentUser, onOpenProfile }) {
       cover_position_x: coverPositionX,
       cover_position_y: coverPositionY,
       event_timezone: eventTimezone
-    }]);
+    }]).select('id, title, city, venue').single();
 
     if (error) {
       setErrorMessage('Nao foi possivel publicar o evento.');
       setSaving(false);
       return;
     }
+
+    const { data: followersData } = await supabase
+      .from('user_follows')
+      .select('follower_id')
+      .eq('following_id', currentUser.id);
+
+    await createNotificationsBulk(
+      (followersData || []).map((row) => ({
+        recipientId: row.follower_id,
+        actorId: currentUser.id,
+        type: 'event_new',
+        title: `${currentUser.name || 'Um artista'} publicou um novo evento`,
+        body: `${createdEvent?.title || title} - ${(createdEvent?.venue || venue)}, ${(createdEvent?.city || city)}`,
+        entityType: 'event',
+        entityId: createdEvent?.id || null
+      }))
+    );
 
     setShowCreate(false);
     setSaving(false);
@@ -2855,6 +3623,171 @@ function EventsView({ currentUser, onOpenProfile }) {
         query={mapModal.query}
         onClose={() => setMapModal({ open: false, title: '', query: '' })}
       />
+    </div>
+  );
+}
+
+function NotificationsView({ currentUser, onOpenProfile, onNavigate }) {
+  const [notifications, setNotifications] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [markingAll, setMarkingAll] = useState(false);
+
+  const fetchNotifications = async () => {
+    setLoading(true);
+    const { data } = await supabase
+      .from('notifications')
+      .select('*, actor:profiles!notifications_actor_id_fkey(id, name, handle, avatar_url)')
+      .eq('recipient_id', currentUser.id)
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    setNotifications(data || []);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    fetchNotifications();
+
+    const channel = supabase
+      .channel(`notifications-${currentUser.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications', filter: `recipient_id=eq.${currentUser.id}` }, () => {
+        fetchNotifications();
+      })
+      .subscribe();
+
+    return () => supabase.removeChannel(channel);
+  }, [currentUser.id]);
+
+  const formatTime = (isoDate) => {
+    if (!isoDate) return '';
+    const date = new Date(isoDate);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return 'agora';
+    if (diffMin < 60) return `${diffMin} min`;
+    const diffHours = Math.floor(diffMin / 60);
+    if (diffHours < 24) return `${diffHours} h`;
+    const diffDays = Math.floor(diffHours / 24);
+    if (diffDays < 7) return `${diffDays} d`;
+    return date.toLocaleDateString();
+  };
+
+  const unreadCount = notifications.filter((item) => !item.is_read).length;
+
+  const markRead = async (notificationId) => {
+    const id = Number(notificationId);
+    if (!Number.isFinite(id)) return;
+    setNotifications((prev) => prev.map((item) => (item.id === id ? { ...item, is_read: true } : item)));
+    await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('id', id)
+      .eq('recipient_id', currentUser.id);
+  };
+
+  const markAllRead = async () => {
+    if (!unreadCount || markingAll) return;
+    setMarkingAll(true);
+    setNotifications((prev) => prev.map((item) => ({ ...item, is_read: true })));
+    await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('recipient_id', currentUser.id)
+      .eq('is_read', false);
+    setMarkingAll(false);
+  };
+
+  const openFromNotification = async (item) => {
+    await markRead(item.id);
+    const entityType = item.entity_type;
+    const entityId = String(item.entity_id || '');
+
+    if (entityType === 'profile' && entityId) {
+      onOpenProfile?.(entityId);
+      return;
+    }
+
+    if (entityType === 'message') {
+      if (item.actor_id) window.localStorage.setItem('sonora_direct_target', String(item.actor_id));
+      onNavigate?.('direct');
+      return;
+    }
+
+    if (entityType === 'post') {
+      onNavigate?.('feed');
+      return;
+    }
+
+    if (entityType === 'community') {
+      onNavigate?.('communities');
+      return;
+    }
+
+    if (entityType === 'event') {
+      onNavigate?.('events');
+      return;
+    }
+  };
+
+  const getTypeBadge = (type) => {
+    if (type === 'like') return 'Like';
+    if (type === 'comment') return 'Comentario';
+    if (type === 'follow') return 'Follow';
+    if (type === 'community_invite') return 'Comunidade';
+    if (type === 'message') return 'Mensagem';
+    if (type === 'event_new') return 'Evento';
+    return 'Notificacao';
+  };
+
+  return (
+    <div className="p-4 md:p-8 max-w-3xl mx-auto">
+      <div className="flex items-center justify-between gap-3 mb-6">
+        <div>
+          <h2 className="text-2xl font-bold text-white flex items-center gap-2"><Bell className="w-6 h-6 text-violet-400" /> Notificacoes</h2>
+          <p className="text-zinc-400 text-sm">{unreadCount} nao lida(s)</p>
+        </div>
+        <button
+          type="button"
+          onClick={markAllRead}
+          disabled={!unreadCount || markingAll}
+          className="px-3 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
+        >
+          Marcar todas como lidas
+        </button>
+      </div>
+
+      <div className="space-y-3">
+        {loading && <p className="text-sm text-zinc-500">Carregando notificacoes...</p>}
+        {!loading && notifications.length === 0 && <p className="text-sm text-zinc-500">Sem notificacoes por enquanto.</p>}
+        {!loading && notifications.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => openFromNotification(item)}
+            className={`w-full text-left rounded-2xl border p-4 transition-colors ${
+              item.is_read ? 'bg-zinc-900 border-zinc-800 hover:bg-zinc-800' : 'bg-violet-500/10 border-violet-500/30 hover:bg-violet-500/15'
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              <img
+                src={item.actor?.avatar_url || `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.actor?.name || item.title || 'N'}`}
+                className="w-10 h-10 rounded-full object-cover bg-zinc-800 shrink-0"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm font-semibold text-white truncate">{item.title}</p>
+                  <span className="text-[11px] text-zinc-400 shrink-0">{formatTime(item.created_at)}</span>
+                </div>
+                {item.body && <p className="text-sm text-zinc-300 mt-1 line-clamp-2">{item.body}</p>}
+                <div className="mt-2">
+                  <span className="text-[11px] px-2 py-1 rounded-md bg-zinc-800 text-zinc-300">{getTypeBadge(item.type)}</span>
+                </div>
+              </div>
+            </div>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -3490,7 +4423,7 @@ function AscensaoView({ currentUser, onOpenProfile }) {
   );
 }
 
-function ProfileView({ user, setUser, viewerUser }) {
+function ProfileView({ user, setUser, viewerUser, onOpenProfile }) {
   const [isEditing, setIsEditing] = useState(false);
   const [editForm, setEditForm] = useState({ name: user.name, bio: user.bio || '', handle: user.handle });
   const [uploading, setUploading] = useState(false);
@@ -3511,6 +4444,10 @@ function ProfileView({ user, setUser, viewerUser }) {
   const [profilePlaylists, setProfilePlaylists] = useState([]);
   const [profileCommunities, setProfileCommunities] = useState([]);
   const [profileAscensaoPosts, setProfileAscensaoPosts] = useState([]);
+  const [blockedUsers, setBlockedUsers] = useState([]);
+  const [loadingBlockedUsers, setLoadingBlockedUsers] = useState(false);
+  const [isBlockedProfile, setIsBlockedProfile] = useState(false);
+  const [moderationLoading, setModerationLoading] = useState(false);
 
   const avatarRef = useRef(null);
   const coverRef = useRef(null);
@@ -3646,6 +4583,8 @@ function ProfileView({ user, setUser, viewerUser }) {
     loadFollowStats();
     loadProfileCollections();
     loadFollowingState();
+    if (isOwnProfile) loadBlockedUsers();
+    else setBlockedUsers([]);
   }, [user.id, viewerUser?.id]);
 
   const loadFollowStats = async () => {
@@ -3732,14 +4671,156 @@ function ProfileView({ user, setUser, viewerUser }) {
       setFollowsMode('local');
     } else {
       setFollowsMode('remote');
+      if (nextFollowing) {
+        await createNotification({
+          recipientId: followingId,
+          actorId: followerId,
+          type: 'follow',
+          title: `${viewerUser?.name || 'Alguem'} comecou a seguir voce`,
+          entityType: 'profile',
+          entityId: followerId
+        });
+      }
     }
 
     setFollowLoading(false);
   };
 
+  const handleReportProfile = async () => {
+    if (!viewerUser?.id || !user?.id || isOwnProfile) return;
+    const reasonPayload = askModerationReason('perfil');
+    if (!reasonPayload) return;
+
+    const result = await submitModerationReport({
+      reporterId: viewerUser.id,
+      reportedUserId: user.id,
+      targetType: 'profile',
+      targetProfileId: user.id,
+      reason: reasonPayload.reason,
+      details: reasonPayload.details
+    });
+
+    alert(result.ok ? 'Denuncia enviada.' : result.message);
+  };
+
+  const handleUnblockFromList = async (blockedId) => {
+    if (!viewerUser?.id || !blockedId || moderationLoading) return;
+    setModerationLoading(true);
+    const result = await unblockUser({ blockerId: viewerUser.id, blockedId });
+    if (!result.ok) {
+      alert(result.message);
+      setModerationLoading(false);
+      return;
+    }
+    setBlockedUsers((prev) => prev.filter((entry) => String(entry.id) !== String(blockedId)));
+    if (String(user.id) === String(blockedId)) {
+      setIsBlockedProfile(false);
+      await loadProfileCollections();
+    }
+    setModerationLoading(false);
+  };
+
+  const handleToggleBlockProfile = async () => {
+    if (!viewerUser?.id || !user?.id || isOwnProfile || moderationLoading) return;
+
+    if (isBlockedProfile) {
+      if (!window.confirm(`Desbloquear ${user.name || 'este usuario'}?`)) return;
+      setModerationLoading(true);
+      const result = await unblockUser({ blockerId: viewerUser.id, blockedId: user.id });
+      if (!result.ok) {
+        alert(result.message);
+        setModerationLoading(false);
+        return;
+      }
+      setIsBlockedProfile(false);
+      setCollectionsMessage('');
+      await loadProfileCollections();
+      setModerationLoading(false);
+      alert('Usuario desbloqueado com sucesso.');
+      return;
+    }
+
+    if (!window.confirm(`Bloquear ${user.name || 'este usuario'}? O conteudo dele sera ocultado para voce.`)) return;
+
+    setModerationLoading(true);
+    const result = await blockUser({ blockerId: viewerUser.id, blockedId: user.id });
+    if (!result.ok) {
+      alert(result.message);
+      setModerationLoading(false);
+      return;
+    }
+
+    setIsBlockedProfile(true);
+    setIsFollowingProfile(false);
+    setProfilePosts([]);
+    setProfilePlaylists([]);
+    setProfileCommunities([]);
+    setProfileAscensaoPosts([]);
+    setCollectionsMessage('Usuario bloqueado. Use o botao "Desbloquear" para voltar a ver o conteudo.');
+    setModerationLoading(false);
+    alert('Usuario bloqueado com sucesso.');
+  };
+
+  const loadBlockedUsers = async () => {
+    if (!viewerUser?.id || !isOwnProfile) {
+      setBlockedUsers([]);
+      return;
+    }
+
+    setLoadingBlockedUsers(true);
+    const { data, error } = await supabase
+      .from('user_blocks')
+      .select('blocked_id, profiles!user_blocks_blocked_id_fkey(id, name, handle, avatar_url)')
+      .eq('blocker_id', viewerUser.id)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      setBlockedUsers([]);
+      setLoadingBlockedUsers(false);
+      return;
+    }
+
+    const normalized = (data || [])
+      .map((entry) => entry?.profiles)
+      .filter((profile) => profile?.id)
+      .map((profile) => ({
+        id: profile.id,
+        name: profile.name || 'Usuario',
+        handle: profile.handle || '',
+        avatar_url: profile.avatar_url || ''
+      }));
+
+    setBlockedUsers(normalized);
+    setLoadingBlockedUsers(false);
+  };
+
   const loadProfileCollections = async () => {
     setLoadingCollections(true);
     setCollectionsMessage('');
+
+    if (!isOwnProfile && viewerUser?.id && user?.id) {
+      const { data: blockData, error: blockError } = await supabase
+        .from('user_blocks')
+        .select('id')
+        .eq('blocker_id', viewerUser.id)
+        .eq('blocked_id', user.id)
+        .limit(1);
+
+      const blockedByViewer = !blockError && Array.isArray(blockData) && blockData.length > 0;
+      setIsBlockedProfile(blockedByViewer);
+
+      if (blockedByViewer) {
+        setProfilePosts([]);
+        setProfilePlaylists([]);
+        setProfileCommunities([]);
+        setProfileAscensaoPosts([]);
+        setCollectionsMessage('Usuario bloqueado. Desbloqueie no banco para voltar a ver o conteudo.');
+        setLoadingCollections(false);
+        return;
+      }
+    } else {
+      setIsBlockedProfile(false);
+    }
 
     const localMembershipState = getLocalCommunityMembershipState(user.id);
     const localAscensaoPosts = getLocalAscensaoPostsState()
@@ -3905,6 +4986,38 @@ function ProfileView({ user, setUser, viewerUser }) {
     }
   };
 
+  const handleDeleteProfilePost = async (postId) => {
+    if (!isOwnProfile || !postId) return;
+    if (!window.confirm('Remover este post do seu perfil e do feed?')) return;
+    const { error } = await supabase
+      .from('posts')
+      .delete()
+      .eq('id', postId)
+      .eq('user_id', viewerUser.id);
+    if (error) {
+      alert('Nao foi possivel remover este post.');
+      return;
+    }
+    await loadProfileCollections();
+  };
+
+  const handleReportProfilePost = async (post) => {
+    if (isOwnProfile || !viewerUser?.id || !post?.id) return;
+    const reasonPayload = askModerationReason('post');
+    if (!reasonPayload) return;
+
+    const result = await submitModerationReport({
+      reporterId: viewerUser.id,
+      reportedUserId: post.user_id || user.id || null,
+      targetType: 'post',
+      targetPostId: post.id,
+      reason: reasonPayload.reason,
+      details: reasonPayload.details
+    });
+
+    alert(result.ok ? 'Denuncia enviada.' : result.message);
+  };
+
   const tabItems = [
     { id: 'posts', label: `Posts (${profilePosts.length})` },
     { id: 'playlists', label: `Playlists (${profilePlaylists.length})` },
@@ -3923,7 +5036,28 @@ function ProfileView({ user, setUser, viewerUser }) {
           const spotifyData = parseSpotifyLink(post.spotify_url);
           return (
             <div key={`profile-post-${post.id}`} className="bg-zinc-950 border border-zinc-800 rounded-xl p-4">
-              <p className="text-xs text-zinc-500 mb-2">{new Date(post.created_at).toLocaleDateString()}</p>
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <p className="text-xs text-zinc-500">{new Date(post.created_at).toLocaleDateString()}</p>
+                {isOwnProfile ? (
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteProfilePost(post.id)}
+                    className="text-zinc-500 hover:text-red-400"
+                    title="Remover conteudo"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => handleReportProfilePost(post)}
+                    className="text-zinc-500 hover:text-amber-300"
+                    title="Denunciar post"
+                  >
+                    <Flag className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
               {post.content && <p className="text-sm text-zinc-200 whitespace-pre-wrap mb-3">{post.content}</p>}
               {post.media_url && post.media_type === 'image' && (
                 <img src={post.media_url} className="rounded-xl w-full object-cover max-h-80 mb-3" />
@@ -4057,6 +5191,10 @@ function ProfileView({ user, setUser, viewerUser }) {
       return <p className="text-sm text-zinc-500">Carregando conteudo do perfil...</p>;
     }
 
+    if (isBlockedProfile) {
+      return <p className="text-sm text-zinc-500">Este perfil esta bloqueado para voce.</p>;
+    }
+
     if (activeProfileTab === 'posts') return renderPostsTab();
     if (activeProfileTab === 'playlists') return renderPlaylistsTab();
     if (activeProfileTab === 'communities') return renderCommunitiesTab();
@@ -4087,7 +5225,7 @@ function ProfileView({ user, setUser, viewerUser }) {
 
   return (
     <div className="p-4 md:p-8 max-w-4xl mx-auto">
-      <div className="bg-zinc-900 border border-zinc-800 rounded-3xl overflow-hidden relative mb-8 shadow-xl">
+        <div className="bg-zinc-900 border border-zinc-800 rounded-3xl overflow-hidden relative mb-8 shadow-xl">
         <div className="h-48 bg-zinc-800 relative group">
           {user.cover_url ? <img src={user.cover_url} className="w-full h-full object-cover" /> : <div className="w-full h-full bg-gradient-to-r from-violet-900 to-zinc-900" />}
           {isOwnProfile && isEditing && (
@@ -4107,14 +5245,36 @@ function ProfileView({ user, setUser, viewerUser }) {
                 </div>
               )
             ) : (
-              <button
-                type="button"
-                onClick={toggleFollowProfile}
-                disabled={followLoading}
-                className={`px-4 py-2 rounded-full text-sm font-medium transition-colors ${isFollowingProfile ? 'bg-zinc-800 text-zinc-100 hover:bg-zinc-700' : 'bg-violet-600 text-white hover:bg-violet-700'} disabled:opacity-60`}
-              >
-                {followLoading ? 'Salvando...' : isFollowingProfile ? 'Seguindo' : 'Seguir'}
-              </button>
+              <div className="flex flex-col items-end gap-2">
+                <button
+                  type="button"
+                  onClick={toggleFollowProfile}
+                  disabled={followLoading || moderationLoading || isBlockedProfile}
+                  className={`px-4 py-2 rounded-full text-sm font-medium transition-colors ${isFollowingProfile ? 'bg-zinc-800 text-zinc-100 hover:bg-zinc-700' : 'bg-violet-600 text-white hover:bg-violet-700'} disabled:opacity-60`}
+                >
+                  {followLoading ? 'Salvando...' : isFollowingProfile ? 'Seguindo' : 'Seguir'}
+                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleReportProfile}
+                    disabled={moderationLoading}
+                    className="px-3 py-1.5 rounded-full text-xs font-semibold bg-zinc-800 text-zinc-200 hover:bg-zinc-700 disabled:opacity-60 inline-flex items-center gap-1"
+                  >
+                    <Flag className="w-3.5 h-3.5" />
+                    Denunciar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleToggleBlockProfile}
+                    disabled={moderationLoading}
+                    className="px-3 py-1.5 rounded-full text-xs font-semibold bg-zinc-900 text-zinc-200 hover:bg-zinc-800 disabled:opacity-60 inline-flex items-center gap-1"
+                  >
+                    <UserX className="w-3.5 h-3.5" />
+                    {isBlockedProfile ? 'Desbloquear' : 'Bloquear'}
+                  </button>
+                </div>
+              </div>
             )}
           </div>
         </div>
@@ -4293,6 +5453,45 @@ function ProfileView({ user, setUser, viewerUser }) {
           </div>
         </div>
       </div>
+
+      {isOwnProfile && (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 md:p-6 mb-8">
+          <div className="flex items-center justify-between gap-3 mb-4">
+            <h3 className="text-lg font-bold text-white">Usuarios bloqueados</h3>
+            {loadingBlockedUsers && <span className="text-xs text-zinc-500">Atualizando...</span>}
+          </div>
+
+          {!loadingBlockedUsers && blockedUsers.length === 0 && (
+            <p className="text-sm text-zinc-500">Voce ainda nao bloqueou ninguem.</p>
+          )}
+
+          <div className="space-y-2">
+            {blockedUsers.map((blockedProfile) => (
+              <div key={`blocked-${blockedProfile.id}`} className="bg-zinc-950 border border-zinc-800 rounded-xl p-3 flex items-center justify-between gap-3">
+                <button
+                  type="button"
+                  onClick={() => onOpenProfile?.(blockedProfile.id)}
+                  className="flex items-center gap-3 text-left min-w-0"
+                >
+                  <img src={blockedProfile.avatar_url || `https://api.dicebear.com/7.x/avataaars/svg?seed=${blockedProfile.name}`} className="w-10 h-10 rounded-full object-cover bg-zinc-800" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-white truncate">{blockedProfile.name}</p>
+                    <p className="text-xs text-zinc-500 truncate">{blockedProfile.handle}</p>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleUnblockFromList(blockedProfile.id)}
+                  disabled={moderationLoading}
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60"
+                >
+                  Desbloquear
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 md:p-6 mb-8">
         <div className="flex flex-wrap gap-2 mb-5">
